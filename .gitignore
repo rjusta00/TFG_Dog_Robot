@@ -1,0 +1,37 @@
+# Entornos virtuales
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Dataset y material de entrenamiento
+datasets/
+frames/
+videos/
+
+# Resultados generados por Ultralytics
+runs/
+*.cache
+
+# Modelos y exportaciones generadas
+models/
+*.pt
+*.onnx
+*.engine
+*.torchscript
+
+# Variables privadas
+.env
+.env.*
+
+# Editores
+.vscode/
+.idea/
+
+# Sistema operativo
+Thumbs.db
+.DS_Store

@@ -1,0 +1,10 @@
+path: ./dataset
+
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: flock
+  1: dog
+  2: robot
