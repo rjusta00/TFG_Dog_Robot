@@ -2,6 +2,7 @@ import argparse
 import csv
 import math
 from pathlib import Path
+from collections import deque
 
 import cv2
 import numpy as np
@@ -113,7 +114,7 @@ def calculate_desired_heading(
     )
 
 
-def calculate_controller(
+def calculate_desired_control(
     robot_x: float,
     robot_y: float,
     theta: float,
@@ -125,13 +126,15 @@ def calculate_controller(
     arrival_radius: float,
 ) -> tuple[float, float, float, float]:
     """
-    Controlador sencillo para llegar al punto deseado.
+    Calcula el control que querríamos aplicar al robot.
 
+    Todavía NO tiene en cuenta aceleraciones.
     Devuelve:
-      v       -> velocidad lineal
-      omega   -> velocidad angular
-      distance
-      heading_error
+
+        desired_v
+        desired_omega
+        distance
+        heading_error
     """
 
     dx = desired_x - robot_x
@@ -142,6 +145,8 @@ def calculate_controller(
         dy,
     )
 
+    # Si estamos suficientemente cerca,
+    # queremos detenernos.
     if distance <= arrival_radius:
         return (
             0.0,
@@ -161,44 +166,159 @@ def calculate_controller(
         desired_heading - theta
     )
 
-    # Control proporcional de orientación.
-    omega = (
+    # ===============================
+    # VELOCIDAD ANGULAR DESEADA
+    # ===============================
+
+    desired_omega = (
         heading_gain
         * heading_error
     )
 
-    # Limitamos la velocidad angular.
-    omega = max(
+    desired_omega = max(
         -max_omega,
-        min(max_omega, omega),
+        min(
+            max_omega,
+            desired_omega,
+        ),
     )
 
-    # Cuanto peor orientado esté el robot,
-    # más despacio debe avanzar.
+    # ===============================
+    # VELOCIDAD LINEAL DESEADA
+    # ===============================
+
+    # Si el robot está mal orientado,
+    # reducimos la velocidad.
     alignment = max(
         0.0,
         math.cos(heading_error),
     )
 
-    v = (
+    desired_v = (
         max_speed
         * alignment
     )
 
-    # También reducimos la velocidad al acercarnos.
+    # Reducimos velocidad al acercarnos
+    # al punto deseado.
     slowdown_distance = 150.0
 
     if distance < slowdown_distance:
-        v *= (
+        desired_v *= (
             distance
             / slowdown_distance
         )
 
     return (
-        v,
-        omega,
+        desired_v,
+        desired_omega,
         distance,
         heading_error,
+    )
+
+def limit_rate(
+    desired_value: float,
+    previous_value: float,
+    maximum_rate: float,
+    dt: float,
+) -> float:
+    """
+    Limita cuánto puede cambiar una variable entre dos instantes.
+
+    Implementa:
+
+        |u(k) - u(k-1)| <= u_dot_max * Ts
+    """
+
+    maximum_change = (
+        maximum_rate
+        * dt
+    )
+
+    difference = (
+        desired_value
+        - previous_value
+    )
+
+    difference = max(
+        -maximum_change,
+        min(
+            maximum_change,
+            difference,
+        ),
+    )
+
+    return (
+        previous_value
+        + difference
+    )
+
+def apply_control_constraints(
+    desired_v: float,
+    desired_omega: float,
+    previous_v: float,
+    previous_omega: float,
+    dt: float,
+    min_speed: float,
+    max_speed: float,
+    max_omega: float,
+    max_acceleration: float,
+    max_angular_acceleration: float,
+) -> tuple[float, float]:
+    """
+    Aplica las restricciones físicas del robot.
+
+    1. Límite de velocidad.
+    2. Límite de velocidad angular.
+    3. Límite de aceleración lineal.
+    4. Límite de aceleración angular.
+    """
+
+    # ====================================
+    # 1. Límites absolutos
+    # ====================================
+
+    desired_v = max(
+        min_speed,
+        min(
+            max_speed,
+            desired_v,
+        ),
+    )
+
+    desired_omega = max(
+        -max_omega,
+        min(
+            max_omega,
+            desired_omega,
+        ),
+    )
+
+    # ====================================
+    # 2. Restricción de aceleración
+    # ====================================
+
+    constrained_v = limit_rate(
+        desired_value=desired_v,
+        previous_value=previous_v,
+        maximum_rate=max_acceleration,
+        dt=dt,
+    )
+
+    # ====================================
+    # 3. Restricción de aceleración angular
+    # ====================================
+
+    constrained_omega = limit_rate(
+        desired_value=desired_omega,
+        previous_value=previous_omega,
+        maximum_rate=max_angular_acceleration,
+        dt=dt,
+    )
+
+    return (
+        constrained_v,
+        constrained_omega,
     )
 
 
@@ -317,6 +437,8 @@ def simulate_robot(
     initial_heading_degrees: float,
     max_speed: float,
     max_omega_degrees: float,
+    max_acceleration: float,
+    max_angular_acceleration_degrees: float,
     heading_gain: float,
     arrival_radius: float,
     run_name: str,
@@ -434,7 +556,11 @@ def simulate_robot(
         max_omega_degrees
     )
 
-    robot_trajectory = []
+    max_angular_acceleration = math.radians(
+        max_angular_acceleration_degrees
+    )
+
+    robot_trajectory = deque(maxlen=500)
 
     frame_index = 0
 
@@ -489,6 +615,8 @@ def simulate_robot(
                 "theta_degrees",
                 "velocity",
                 "omega_degrees",
+                "linear_acceleration",
+                "angular_acceleration_degrees",
                 "desired_x",
                 "desired_y",
                 "distance",
@@ -517,11 +645,11 @@ def simulate_robot(
                 )
 
                 (
-                    v,
-                    omega,
+                    desired_v,
+                    desired_omega,
                     distance,
                     heading_error,
-                ) = calculate_controller(
+                ) = calculate_desired_control(
                     robot_x=robot_x,
                     robot_y=robot_y,
                     theta=theta,
@@ -531,6 +659,25 @@ def simulate_robot(
                     max_omega=max_omega,
                     heading_gain=heading_gain,
                     arrival_radius=arrival_radius,
+                )
+
+                previous_v = v
+                previous_omega = omega
+
+                (
+                    v,
+                    omega,
+                ) = apply_control_constraints(
+                    desired_v=desired_v,
+                    desired_omega=desired_omega,
+                    previous_v=previous_v,
+                    previous_omega=previous_omega,
+                    dt=dt,
+                    min_speed=0.0,
+                    max_speed=max_speed,
+                    max_omega=max_omega,
+                    max_acceleration=max_acceleration,
+                    max_angular_acceleration=max_angular_acceleration,
                 )
 
                 # Aplicamos la ecuación cinemática.
@@ -655,6 +802,14 @@ def simulate_robot(
                     )
                 )
 
+                linear_acceleration = (
+                    v - previous_v
+                ) / dt
+
+                angular_acceleration = (
+                    omega - previous_omega
+                ) / dt
+
                 cv2.putText(
                     frame,
                     (
@@ -707,6 +862,32 @@ def simulate_robot(
                     2,
                 )
 
+                cv2.putText(
+                    frame,
+                    (
+                        f"Aceleracion: "
+                        f"{linear_acceleration:.1f} px/s2"
+                    ),
+                    (30, 210),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 255),
+                    2,
+                )
+
+                cv2.putText(
+                    frame,
+                    (
+                        f"Acel. angular: "
+                        f"{math.degrees(angular_acceleration):.1f} deg/s2"
+                    ),
+                    (30, 250),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 255),
+                    2,
+                )
+
                 csv_writer.writerow(
                     [
                         frame_index,
@@ -716,6 +897,8 @@ def simulate_robot(
                         f"{theta_degrees:.3f}",
                         f"{v:.3f}",
                         f"{omega_degrees:.3f}",
+                        f"{linear_acceleration:.3f}",
+                        f"{math.degrees(angular_acceleration):.3f}",
                         f"{desired_x:.3f}",
                         f"{desired_y:.3f}",
                         f"{distance:.3f}",
@@ -824,6 +1007,26 @@ def parse_arguments():
         default="kinematics_v1",
     )
 
+    parser.add_argument(
+        "--max-acceleration",
+        type=float,
+        default=150.0,
+        help=(
+            "Aceleración lineal máxima "
+            "en píxeles/segundo²."
+        ),
+    )
+
+    parser.add_argument(
+        "--max-angular-acceleration",
+        type=float,
+        default=180.0,
+        help=(
+            "Aceleración angular máxima "
+            "en grados/segundo²."
+        ),
+    )
+
     return parser.parse_args()
 
 
@@ -841,6 +1044,8 @@ def main():
         heading_gain=args.heading_gain,
         arrival_radius=args.arrival_radius,
         run_name=args.name,
+        max_acceleration=args.max_acceleration,
+        max_angular_acceleration_degrees=args.max_angular_acceleration,
     )
 
 
