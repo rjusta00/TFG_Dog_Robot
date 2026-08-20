@@ -35,3 +35,6 @@ models/
 # Sistema operativo
 Thumbs.db
 .DS_Store
+
+# Agente principal IA
+AGENTS.md
