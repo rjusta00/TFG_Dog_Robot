@@ -28,6 +28,14 @@ def train_model(
     epochs: int,
     image_size: int,
     batch_size: int,
+    patience: int,
+    device: str | None,
+    optimizer: str,
+    seed: int,
+    cache: bool,
+    use_amp: bool,
+    close_mosaic: int,
+    dropout: float,
     run_name: str,
 ) -> None:
     """
@@ -52,28 +60,53 @@ def train_model(
     print(f"Épocas: {epochs}")
     print(f"Resolución: {image_size}")
     print(f"Batch: {batch_size}")
+    print(f"Patience: {patience}")
+    print(f"Optimizer: {optimizer}")
+    print(f"AMP: {use_amp}")
+    print(f"Cache: {cache}")
+    print(f"Close mosaic: {close_mosaic}")
+
+    if device:
+        print(f"Device: {device}")
 
     model = YOLO(model_name)
 
-    results = model.train(
-        data=str(dataset_yaml),
-        epochs=epochs,
-        imgsz=image_size,
-        batch=batch_size,
+    train_kwargs = {
+        "data": str(dataset_yaml),
+        "epochs": epochs,
+        "imgsz": image_size,
+        "batch": batch_size,
 
         # workers=0 evita algunos problemas
         # de multiprocessing en Windows.
-        workers=0,
+        "workers": 0,
 
-        project=str(
+        "project": str(
             RUNS_DIRECTORY / "train"
         ),
-        name=run_name,
-        exist_ok=True,
+        "name": run_name,
+        "exist_ok": True,
 
-        patience=10,
-        plots=True,
-        verbose=True,
+        # Entrenamiento más estable para un dataset pequeño
+        # y con objetos difíciles como el perro.
+        "patience": patience,
+        "optimizer": optimizer,
+        "seed": seed,
+        "deterministic": True,
+        "cache": cache,
+        "amp": use_amp,
+        "cos_lr": True,
+        "close_mosaic": close_mosaic,
+        "dropout": dropout,
+        "plots": True,
+        "verbose": True,
+    }
+
+    if device:
+        train_kwargs["device"] = device
+
+    results = model.train(
+        **train_kwargs,
     )
 
     training_directory = Path(
@@ -125,6 +158,35 @@ def train_model(
         f"{destination_model.resolve()}"
     )
 
+    # Si el dataset define un split test, ejecutamos una
+    # evaluación final para no depender solo de validación.
+    print("\n" + "=" * 70)
+    print("EVALUACIÓN FINAL")
+    print("=" * 70)
+
+    try:
+        test_results = model.val(
+            data=str(dataset_yaml),
+            split="test",
+            imgsz=image_size,
+            batch=batch_size,
+            device=device,
+            workers=0,
+            plots=True,
+            verbose=True,
+        )
+
+        print(
+            f"Evaluación test completada: {test_results.save_dir}"
+        )
+
+    except Exception as error:
+        print(
+            "No se pudo ejecutar la evaluación sobre el split test. "
+            "Continuando sin esa evaluación."
+        )
+        print(f"Motivo: {error}")
+
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -141,15 +203,15 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default="yolo26n.pt",
-        help="Modelo inicial. Por defecto: yolo26n.pt.",
+        default="yolo26s.pt",
+        help="Modelo inicial. Por defecto: yolo26s.pt.",
     )
 
     parser.add_argument(
         "--epochs",
         type=int,
-        default=20,
-        help="Número de épocas. Por defecto: 20.",
+        default=100,
+        help="Número de épocas. Por defecto: 100.",
     )
 
     parser.add_argument(
@@ -162,8 +224,62 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2,
+        default=8,
         help="Imágenes por lote.",
+    )
+
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=30,
+        help="Épocas sin mejora antes de parar.",
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Dispositivo, por ejemplo cpu, 0 o 0,1.",
+    )
+
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="auto",
+        help="Optimizador de Ultralytics. Por defecto: auto.",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Semilla aleatoria para reproducibilidad.",
+    )
+
+    parser.add_argument(
+        "--cache",
+        action="store_true",
+        help="Carga imágenes en caché para acelerar el entrenamiento.",
+    )
+
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Desactiva mixed precision si diera problemas.",
+    )
+
+    parser.add_argument(
+        "--close-mosaic",
+        type=int,
+        default=10,
+        help="Cierra mosaic en las últimas épocas para mejorar cajas finales.",
+    )
+
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.0,
+        help="Dropout del head. Por defecto: 0.0.",
     )
 
     parser.add_argument(
@@ -185,6 +301,14 @@ def main() -> None:
         epochs=args.epochs,
         image_size=args.image_size,
         batch_size=args.batch_size,
+        patience=args.patience,
+        device=args.device,
+        optimizer=args.optimizer,
+        seed=args.seed,
+        cache=args.cache,
+        use_amp=not args.no_amp,
+        close_mosaic=args.close_mosaic,
+        dropout=args.dropout,
         run_name=args.name,
     )
 

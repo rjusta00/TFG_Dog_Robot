@@ -95,6 +95,7 @@ def copy_example(
 
 def create_dataset_yaml(
     output_directory: Path,
+    include_test: bool,
 ) -> Path:
     """
     Crea el archivo dataset.yaml utilizado por Ultralytics.
@@ -104,15 +105,31 @@ def create_dataset_yaml(
 
     dataset_root = output_directory.resolve().as_posix()
 
-    yaml_content = f"""path: {dataset_root}
+    yaml_lines = [
+        f"path: {dataset_root}",
+        "",
+        "train: images/train",
+        "val: images/val",
+    ]
 
-train: images/train
-val: images/val
+    if include_test:
+        yaml_lines.append(
+            "test: images/test"
+        )
 
-names:
-  0: flock
-  1: dog
-"""
+    yaml_lines.extend(
+        [
+            "",
+            "names:",
+            "  0: flock",
+            "  1: dog",
+            "",
+        ]
+    )
+
+    yaml_content = "\n".join(
+        yaml_lines
+    )
 
     yaml_path.write_text(
         yaml_content,
@@ -127,10 +144,11 @@ def prepare_dataset(
     labels_directory: Path,
     output_directory: Path,
     train_ratio: float,
+    test_ratio: float,
     seed: int,
 ) -> None:
     """
-    Divide un conjunto de imágenes etiquetadas en train y val.
+    Divide un conjunto de imágenes etiquetadas en train, val y test.
     """
 
     if not images_directory.exists():
@@ -148,6 +166,16 @@ def prepare_dataset(
     if not 0 < train_ratio < 1:
         raise ValueError(
             "train_ratio debe ser mayor que 0 y menor que 1."
+        )
+
+    if not 0 <= test_ratio < 1:
+        raise ValueError(
+            "test_ratio debe estar en [0, 1)."
+        )
+
+    if train_ratio + test_ratio >= 1:
+        raise ValueError(
+            "La suma de train_ratio y test_ratio debe ser menor que 1."
         )
 
     images = find_images(images_directory)
@@ -189,9 +217,9 @@ def prepare_dataset(
             "un archivo TXT correspondiente."
         )
 
-    if len(examples) < 2:
+    if len(examples) < 3:
         raise RuntimeError(
-            "Se necesitan al menos dos imágenes etiquetadas."
+            "Se necesitan al menos tres imágenes etiquetadas."
         )
 
     random_generator = random.Random(seed)
@@ -201,14 +229,46 @@ def prepare_dataset(
         len(examples) * train_ratio
     )
 
-    # Garantizamos al menos una imagen en cada conjunto.
-    train_count = max(
-        1,
-        min(train_count, len(examples) - 1),
+    test_count = round(
+        len(examples) * test_ratio
     )
 
+    remaining_examples = len(examples) - test_count
+
+    # Garantizamos al menos una imagen en train y una en val.
+    train_count = max(
+        1,
+        min(train_count, remaining_examples - 1),
+    )
+
+    maximum_test_count = len(examples) - train_count - 1
+
+    test_count = max(
+        0,
+        min(test_count, maximum_test_count),
+    )
+
+    validation_count = (
+        len(examples)
+        - train_count
+        - test_count
+    )
+
+    if validation_count < 1:
+        raise RuntimeError(
+            "No quedan imágenes suficientes para validación. "
+            "Ajusta train_ratio y test_ratio."
+        )
+
     train_examples = examples[:train_count]
-    validation_examples = examples[train_count:]
+    validation_start = train_count
+    test_start = train_count + validation_count
+
+    validation_examples = examples[
+        validation_start:test_start
+    ]
+
+    test_examples = examples[test_start:]
 
     if output_directory.exists():
         print(
@@ -234,14 +294,24 @@ def prepare_dataset(
             split_name="val",
         )
 
+    for image_path, label_path in test_examples:
+        copy_example(
+            image_path=image_path,
+            label_path=label_path,
+            output_directory=output_directory,
+            split_name="test",
+        )
+
     yaml_path = create_dataset_yaml(
         output_directory=output_directory,
+        include_test=bool(test_examples),
     )
 
     print("\nDataset preparado correctamente.")
     print(f"Total de imágenes: {len(examples)}")
     print(f"Entrenamiento: {len(train_examples)}")
     print(f"Validación: {len(validation_examples)}")
+    print(f"Test: {len(test_examples)}")
     print(f"Carpeta: {output_directory.resolve()}")
     print(f"Configuración: {yaml_path.resolve()}")
 
@@ -250,7 +320,7 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Divide imágenes y etiquetas YOLO "
-            "en entrenamiento y validación."
+            "en entrenamiento, validación y test."
         )
     )
 
@@ -289,6 +359,13 @@ def parse_arguments() -> argparse.Namespace:
         help="Semilla para repetir la misma división.",
     )
 
+    parser.add_argument(
+        "--test-ratio",
+        type=float,
+        default=0.1,
+        help="Proporción reservada para test. Por defecto: 0.1.",
+    )
+
     return parser.parse_args()
 
 
@@ -300,6 +377,7 @@ def main() -> None:
         labels_directory=args.labels,
         output_directory=args.output,
         train_ratio=args.train_ratio,
+        test_ratio=args.test_ratio,
         seed=args.seed,
     )
 
