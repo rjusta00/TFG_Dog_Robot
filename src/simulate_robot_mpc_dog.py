@@ -26,7 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL_PATH = (
     PROJECT_ROOT
     / "models"
-    / "dogRobot_v1_1_best.pt"
+    / "dogRobot_v2_best.pt"
 )
 
 OUTPUT_ROOT = (
