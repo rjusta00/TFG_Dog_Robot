@@ -39,7 +39,47 @@ from simulate_robot_mpc import (
     solve_mpc,
     update_state,
 )
-from rear_dog_prediction.simulate_robot_mpc_trained_predictor import build_startup_control
+
+
+def build_startup_control(
+    state: np.ndarray,
+    desired_point: tuple[float, float],
+    dt_control: float,
+    max_speed: float,
+    max_omega: float,
+    max_acceleration: float,
+    max_angular_acceleration: float,
+) -> np.ndarray:
+    dx = desired_point[0] - float(state[0])
+    dy = desired_point[1] - float(state[1])
+    desired_heading = math.atan2(dy, dx)
+    heading_error = desired_heading - float(state[2])
+
+    while heading_error > math.pi:
+        heading_error -= 2.0 * math.pi
+
+    while heading_error < -math.pi:
+        heading_error += 2.0 * math.pi
+
+    target_speed = max_speed * max(0.35, math.cos(heading_error))
+    target_omega = max(
+        -max_omega,
+        min(max_omega, 2.0 * heading_error),
+    )
+
+    maximum_delta_v = max_acceleration * dt_control
+    maximum_delta_omega = max_angular_acceleration * dt_control
+
+    startup_speed = min(target_speed, maximum_delta_v)
+    startup_omega = max(
+        -maximum_delta_omega,
+        min(maximum_delta_omega, target_omega),
+    )
+
+    return np.array(
+        [startup_speed, startup_omega],
+        dtype=float,
+    )
 
 
 def load_predictor(checkpoint_path: Path, device: torch.device):
