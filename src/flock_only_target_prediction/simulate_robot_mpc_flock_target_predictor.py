@@ -19,10 +19,9 @@ from flock_only_target_prediction.common import (
     DEFAULT_DETECTOR_MODEL_PATH,
     OUTPUT_ROOT,
     build_flock_feature_vector,
-    build_linear_target_from_flock,
+    calculate_stable_rear_direction,
     clip_point,
     denormalize_target,
-    estimate_target_from_flock_motion,
     extract_flock_candidates,
     load_detector,
     resolve_project_path,
@@ -35,10 +34,10 @@ from simulate_robot_mpc import (
     draw_predicted_trajectory,
     draw_reference_trajectory,
     draw_robot,
-    smooth_guidance,
     solve_mpc,
     update_state,
 )
+from track_flock_motion import calculate_flock_ellipse, draw_flock_ellipse
 
 
 def build_startup_control(
@@ -90,6 +89,12 @@ def load_predictor(checkpoint_path: Path, device: torch.device):
     except TypeError:
         checkpoint = torch.load(resolved_checkpoint_path, map_location=device)
 
+    if checkpoint.get("target_representation") != "rear_lateral_ellipse_v1":
+        raise ValueError(
+            "El checkpoint no usa la representación rear_lateral_ellipse_v1. "
+            "Vuelve a entrenar el predictor con train_flock_target_predictor.py."
+        )
+
     model = FlockTargetGRUPredictor(
         input_size=int(checkpoint["input_size"]),
         hidden_size=int(checkpoint["hidden_size"]),
@@ -103,56 +108,31 @@ def load_predictor(checkpoint_path: Path, device: torch.device):
     return model, mean, std, checkpoint
 
 
-def select_safe_target(
-    current_row: dict,
-    predicted_point: tuple[float, float],
-    linear_point: tuple[float, float] | None,
-    last_target_point: tuple[int, int] | None,
-) -> tuple[tuple[float, float], str]:
-    flock_scale = max(
-        1.0,
-        float(current_row["flock_width"]),
-        float(current_row["flock_height"]),
-    )
+def get_flock_center(row: dict) -> tuple[float, float]:
+    if "flock_center_x" in row and "flock_center_y" in row:
+        return float(row["flock_center_x"]), float(row["flock_center_y"])
 
-    if last_target_point is not None:
-        jump = math.hypot(
-            predicted_point[0] - last_target_point[0],
-            predicted_point[1] - last_target_point[1],
-        )
-
-        if jump > 0.35 * flock_scale:
-            if linear_point is not None:
-                return linear_point, "LINEAR_FALLBACK"
-
-            return last_target_point, "TARGET_FROZEN"
-
-    return predicted_point, "PREDICTED_FROM_FLOCK"
+    return float(row["flock_x"]), float(row["flock_y"])
 
 
-def smooth_target_point(
-    raw_target_point: tuple[float, float],
-    previous_target_point: tuple[float, float] | None,
-    flock_scale: float,
+def rear_local_coordinates(
+    row: dict,
+    point: tuple[float, float],
 ) -> tuple[float, float]:
-    if previous_target_point is None:
-        return raw_target_point
+    center_x, center_y = get_flock_center(row)
+    rear_x = float(row["rear_direction_x"])
+    rear_y = float(row["rear_direction_y"])
+    lateral_x = -rear_y
+    lateral_y = rear_x
+    major_axis = max(1.0, float(row["flock_ellipse_major_axis"]))
+    minor_axis = max(1.0, float(row["flock_ellipse_minor_axis"]))
+    vector_x = point[0] - center_x
+    vector_y = point[1] - center_y
 
-    alpha = 0.22
-    smoothed_x = alpha * raw_target_point[0] + (1.0 - alpha) * previous_target_point[0]
-    smoothed_y = alpha * raw_target_point[1] + (1.0 - alpha) * previous_target_point[1]
-
-    max_step = 0.12 * flock_scale
-    delta_x = smoothed_x - previous_target_point[0]
-    delta_y = smoothed_y - previous_target_point[1]
-    delta_norm = math.hypot(delta_x, delta_y)
-
-    if delta_norm > max_step and delta_norm > 1e-6:
-        scale = max_step / delta_norm
-        smoothed_x = previous_target_point[0] + delta_x * scale
-        smoothed_y = previous_target_point[1] + delta_y * scale
-
-    return smoothed_x, smoothed_y
+    return (
+        (vector_x * rear_x + vector_y * rear_y) / major_axis,
+        (vector_x * lateral_x + vector_y * lateral_y) / minor_axis,
+    )
 
 
 def build_guidance_from_flock_predictor(
@@ -162,6 +142,7 @@ def build_guidance_from_flock_predictor(
     confidence: float,
     image_size: int,
     predictor_device: str,
+    single_flock: bool,
 ) -> tuple[dict[int, dict], float, int, int, int]:
     video_path = resolve_project_path(video_path)
     detector_model_path = resolve_project_path(detector_model_path)
@@ -201,16 +182,19 @@ def build_guidance_from_flock_predictor(
     print(f"Video: {video_path}")
     print(f"Detector: {detector_model_path}")
     print(f"Predictor: {predictor_checkpoint_path}")
+    print(f"Single flock: {single_flock}")
     print(f"Frames: {total_frames}")
     print()
 
     feature_history: deque[np.ndarray] = deque(maxlen=history_length)
-    flock_history: deque[dict] = deque(maxlen=history_length)
-    target_history: deque[tuple[int, int]] = deque(maxlen=history_length)
     active_flock_track_id = None
     previous_row = None
-    last_target_point = None
-    last_target_point_float = None
+    previous_flock_center = None
+    previous_ellipse_angle = None
+    last_rear_direction = None
+    rear_direction_confidence = 0.0
+    rear_direction_source = "UNKNOWN"
+    ellipse_trajectory: deque[tuple[int, int]] = deque(maxlen=30)
     guidance: dict[int, dict] = {}
     frame_index = 0
 
@@ -231,10 +215,58 @@ def build_guidance_from_flock_predictor(
         )[0]
 
         flock_candidates = extract_flock_candidates(result)
-        selected_flock = select_main_flock(flock_candidates, active_flock_track_id)
+        selected_flock = select_main_flock(
+            candidates=flock_candidates,
+            active_track_id=active_flock_track_id,
+            single_flock=single_flock,
+        )
 
         if selected_flock is not None:
             active_flock_track_id = selected_flock["track_id"]
+            ellipse_trajectory.append(selected_flock["center"])
+
+            if len(ellipse_trajectory) >= 2:
+                window = min(12, len(ellipse_trajectory) - 1)
+                reference_center = ellipse_trajectory[-window - 1]
+                flock_dx = selected_flock["center"][0] - reference_center[0]
+                flock_dy = selected_flock["center"][1] - reference_center[1]
+            elif previous_flock_center is None:
+                flock_dx = 0.0
+                flock_dy = 0.0
+            else:
+                flock_dx = selected_flock["center"][0] - previous_flock_center[0]
+                flock_dy = selected_flock["center"][1] - previous_flock_center[1]
+
+            (
+                last_rear_direction,
+                rear_direction_confidence,
+                rear_direction_source,
+            ) = calculate_stable_rear_direction(
+                trajectory=ellipse_trajectory,
+                last_rear_direction=last_rear_direction,
+                window=12,
+                dead_zone=12.0,
+            )
+
+            if last_rear_direction is None:
+                last_rear_direction = (0.0, 1.0)
+                rear_direction_confidence = 0.0
+                rear_direction_source = "DEFAULT"
+
+            flock_ellipse = calculate_flock_ellipse(
+                x1=selected_flock["box"][0],
+                y1=selected_flock["box"][1],
+                x2=selected_flock["box"][2],
+                y2=selected_flock["box"][3],
+                dx=flock_dx,
+                dy=flock_dy,
+                previous_angle=previous_ellipse_angle,
+                angle_dead_zone=12.0,
+                angle_smoothing=0.12,
+            )
+            previous_ellipse_angle = flock_ellipse[4]
+            previous_flock_center = selected_flock["center"]
+
             current_row = {
                 "frame_width": width,
                 "frame_height": height,
@@ -242,27 +274,25 @@ def build_guidance_from_flock_predictor(
                 "flock_height": selected_flock["height"],
                 "flock_center_x": selected_flock["center"][0],
                 "flock_center_y": selected_flock["center"][1],
+                "rear_direction_x": last_rear_direction[0],
+                "rear_direction_y": last_rear_direction[1],
+                "rear_direction_confidence": rear_direction_confidence,
+                "rear_direction_source": rear_direction_source,
+                "flock_ellipse_center_x": flock_ellipse[0],
+                "flock_ellipse_center_y": flock_ellipse[1],
+                "flock_ellipse_major_axis": flock_ellipse[2],
+                "flock_ellipse_minor_axis": flock_ellipse[3],
+                "flock_ellipse_angle": flock_ellipse[4],
             }
 
             if previous_row is not None and previous_row["frame_index"] != frame_index - 1:
                 previous_row_for_feature = None
                 feature_history.clear()
-                flock_history.clear()
-                target_history.clear()
             else:
                 previous_row_for_feature = previous_row
 
             feature = build_flock_feature_vector(current_row, previous_row_for_feature)
             feature_history.append(feature)
-
-            flock_snapshot = {
-                **current_row,
-                "frame_index": frame_index,
-            }
-            flock_history.append(flock_snapshot)
-
-            linear_target = build_linear_target_from_flock(flock_history, target_history)
-            heuristic_target = estimate_target_from_flock_motion(flock_history)
 
             if len(feature_history) >= history_length:
                 feature_window = np.stack(feature_history, axis=0)[None, ...].astype(np.float32)
@@ -272,42 +302,18 @@ def build_guidance_from_flock_predictor(
                     prediction = predictor(torch.from_numpy(normalized_feature_window).to(device)).cpu().numpy()[0]
 
                 predicted_point = denormalize_target(current_row, prediction)
-                chosen_point, status = select_safe_target(current_row, predicted_point, linear_target, last_target_point)
-                predicted_x, predicted_y = chosen_point
-
-            elif linear_target is not None:
-                predicted_x, predicted_y = linear_target
-                status = "LINEAR_FALLBACK"
-
-            elif heuristic_target is not None:
-                predicted_x, predicted_y = heuristic_target
-                status = "HEURISTIC_BACK_POSITION"
-
-            elif last_target_point is not None:
-                predicted_x, predicted_y = last_target_point
-                status = "TARGET_FROZEN"
-
+                predicted_x, predicted_y = predicted_point
+                status = "PREDICTED_FROM_FLOCK"
             else:
-                predicted_x = float(selected_flock["center"][0])
-                predicted_y = float(selected_flock["center"][1])
-                status = "FLOCK_CENTER_FALLBACK"
+                previous_row = {**current_row, "frame_index": frame_index}
+                frame_index += 1
 
-            flock_scale = max(
-                1.0,
-                float(current_row["flock_width"]),
-                float(current_row["flock_height"]),
-            )
+                if frame_index % 150 == 0:
+                    print(f"Guidance progress: {frame_index}/{total_frames}")
 
-            predicted_x, predicted_y = smooth_target_point(
-                raw_target_point=(predicted_x, predicted_y),
-                previous_target_point=last_target_point_float,
-                flock_scale=flock_scale,
-            )
+                continue
 
             target_point = clip_point((int(round(predicted_x)), int(round(predicted_y))), width, height)
-            last_target_point = target_point
-            last_target_point_float = (float(target_point[0]), float(target_point[1]))
-            target_history.append(target_point)
             previous_row = {**current_row, "frame_index": frame_index}
 
             guidance[frame_index] = {
@@ -321,14 +327,22 @@ def build_guidance_from_flock_predictor(
                 "flock_box_y1": float(selected_flock["box"][1]),
                 "flock_box_x2": float(selected_flock["box"][2]),
                 "flock_box_y2": float(selected_flock["box"][3]),
+                "flock_ellipse_center_x": float(flock_ellipse[0]),
+                "flock_ellipse_center_y": float(flock_ellipse[1]),
+                "flock_ellipse_major_axis": float(flock_ellipse[2]),
+                "flock_ellipse_minor_axis": float(flock_ellipse[3]),
+                "flock_ellipse_angle": float(flock_ellipse[4]),
+                "rear_direction_x": last_rear_direction[0],
+                "rear_direction_y": last_rear_direction[1],
+                "rear_direction_confidence": rear_direction_confidence,
+                "rear_direction_source": rear_direction_source,
                 "flock_confidence": float(selected_flock["confidence"]),
                 "status": status,
             }
 
-        elif last_target_point is not None:
+        else:
             feature_history.clear()
-            flock_history.clear()
-            target_history.clear()
+            ellipse_trajectory.clear()
             previous_row = None
 
         frame_index += 1
@@ -345,14 +359,33 @@ def build_guidance_from_flock_predictor(
 
 
 def draw_overlay(frame: np.ndarray, data: dict) -> None:
-    x1 = int(round(data["flock_box_x1"]))
-    y1 = int(round(data["flock_box_y1"]))
-    x2 = int(round(data["flock_box_x2"]))
-    y2 = int(round(data["flock_box_y2"]))
     flock_point = (int(data["flock_x"]), int(data["flock_y"]))
     target_point = (int(data["target_x"]), int(data["target_y"]))
 
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 3)
+    if "flock_ellipse_center_x" in data:
+        flock_ellipse = (
+            data["flock_ellipse_center_x"],
+            data["flock_ellipse_center_y"],
+            data["flock_ellipse_major_axis"],
+            data["flock_ellipse_minor_axis"],
+            data["flock_ellipse_angle"],
+        )
+    else:
+        flock_ellipse = calculate_flock_ellipse(
+            x1=data["flock_box_x1"],
+            y1=data["flock_box_y1"],
+            x2=data["flock_box_x2"],
+            y2=data["flock_box_y2"],
+            dx=0.0,
+            dy=0.0,
+        )
+
+    draw_flock_ellipse(
+        frame=frame,
+        ellipse=flock_ellipse,
+        color=(255, 255, 0),
+        thickness=3,
+    )
     cv2.circle(frame, flock_point, 10, (255, 255, 0), -1)
     cv2.putText(frame, "Flock center", (flock_point[0] + 15, flock_point[1] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
     cv2.circle(frame, target_point, 18, (0, 255, 0), 4)
@@ -383,6 +416,7 @@ def simulate_robot_mpc_flock_target_predictor(
     confidence: float,
     image_size: int,
     predictor_device: str,
+    single_flock: bool,
     run_name: str,
 ) -> None:
     guidance, fps, width, height, total_frames = build_guidance_from_flock_predictor(
@@ -392,9 +426,9 @@ def simulate_robot_mpc_flock_target_predictor(
         confidence,
         image_size,
         predictor_device,
+        single_flock,
     )
 
-    guidance = smooth_guidance(guidance, smoothing_alpha)
     capture = cv2.VideoCapture(str(resolve_project_path(video_path)))
 
     if not capture.isOpened():
@@ -444,7 +478,7 @@ def simulate_robot_mpc_flock_target_predictor(
 
     with output_csv.open("w", encoding="utf-8", newline="") as csv_file:
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["frame", "time_seconds", "robot_x", "robot_y", "theta_degrees", "velocity", "omega_degrees", "target_x", "target_y", "desired_x", "desired_y", "distance_to_desired", "status", "mpc_cost", "optimizer_success", "optimizer_iterations"])
+        csv_writer.writerow(["frame", "time_seconds", "robot_x", "robot_y", "theta_degrees", "velocity", "omega_degrees", "target_x", "target_y", "desired_x", "desired_y", "distance_to_desired", "status", "rear_direction_x", "rear_direction_y", "rear_direction_confidence", "rear_direction_source", "mpc_cost", "optimizer_success", "optimizer_iterations"])
 
         while True:
             success, frame = capture.read()
@@ -533,7 +567,7 @@ def simulate_robot_mpc_flock_target_predictor(
                 if mpc_updated:
                     cv2.putText(frame, "MPC UPDATED", (30, 45 + len(lines) * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2, cv2.LINE_AA)
 
-                csv_writer.writerow([frame_index, f"{frame_index / fps:.3f}", f"{state[0]:.3f}", f"{state[1]:.3f}", f"{theta_degrees:.3f}", f"{current_control[0]:.3f}", f"{omega_degrees:.3f}", f"{data['target_x']:.3f}", f"{data['target_y']:.3f}", f"{data['desired_x']:.3f}", f"{data['desired_y']:.3f}", f"{distance_to_desired:.3f}", data["status"], f"{last_mpc_cost:.8f}", last_optimizer_success, last_optimizer_iterations])
+                csv_writer.writerow([frame_index, f"{frame_index / fps:.3f}", f"{state[0]:.3f}", f"{state[1]:.3f}", f"{theta_degrees:.3f}", f"{current_control[0]:.3f}", f"{omega_degrees:.3f}", f"{data['target_x']:.3f}", f"{data['target_y']:.3f}", f"{data['desired_x']:.3f}", f"{data['desired_y']:.3f}", f"{distance_to_desired:.3f}", data["status"], f"{float(data.get('rear_direction_x', 0.0)):.6f}", f"{float(data.get('rear_direction_y', 0.0)):.6f}", f"{float(data.get('rear_direction_confidence', 0.0)):.6f}", data.get("rear_direction_source", ""), f"{last_mpc_cost:.8f}", last_optimizer_success, last_optimizer_iterations])
 
             video_writer.write(frame)
             frame_index += 1
@@ -559,6 +593,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--confidence", type=float, default=0.15)
     parser.add_argument("--image-size", type=int, default=960)
     parser.add_argument("--predictor-device", type=str, default="cpu")
+    parser.add_argument("--single-flock", action="store_true", help="Selecciona siempre el rebaño de mayor área en cada frame.")
     parser.add_argument("--robot-start-x", type=float, required=True)
     parser.add_argument("--robot-start-y", type=float, required=True)
     parser.add_argument("--initial-heading", type=float, default=0.0)
@@ -606,6 +641,7 @@ def main() -> None:
         confidence=args.confidence,
         image_size=args.image_size,
         predictor_device=args.predictor_device,
+        single_flock=args.single_flock,
         run_name=args.name,
     )
 

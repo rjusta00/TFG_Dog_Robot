@@ -16,6 +16,7 @@ if str(SRC_ROOT) not in sys.path:
 from flock_only_target_prediction.common import (
     build_flock_feature_vector,
     build_target_vector,
+    enrich_row_with_rear_direction,
 )
 
 
@@ -120,6 +121,16 @@ def build_windows(
                 if int(future_row["frame"]) != int(current_row["frame"]) + prediction_offset_frames:
                     continue
 
+                previous_target_row = (
+                    segment_rows[end_index - 1]
+                    if end_index > 0
+                    else None
+                )
+                current_row = enrich_row_with_rear_direction(
+                    current_row,
+                    previous_target_row,
+                )
+
                 feature_window = np.stack(segment_features[start_index:end_index + 1], axis=0)
                 target = build_target_vector(current_row, future_row)
 
@@ -129,7 +140,7 @@ def build_windows(
 
     if not all_features:
         return (
-            np.empty((0, history_length, 10), dtype=np.float32),
+            np.empty((0, history_length, 12), dtype=np.float32),
             np.empty((0, 2), dtype=np.float32),
             [],
         )
