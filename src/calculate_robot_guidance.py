@@ -5,6 +5,8 @@ from pathlib import Path
 
 import cv2
 
+from track_flock_motion import calculate_flock_ellipse, draw_flock_ellipse
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_ROOT = PROJECT_ROOT / "runs" / "guidance"
@@ -26,7 +28,7 @@ def load_flock_trajectory(
     trajectory_path: Path,
 ) -> dict[int, dict[str, float]]:
     """
-    Carga el centro y la bounding box del rebaño para cada frame.
+    Carga el centro y la elipse del rebaño para cada frame.
     """
 
     if not trajectory_path.exists():
@@ -70,7 +72,7 @@ def load_flock_trajectory(
 
             frame_index = int(row["frame"])
 
-            trajectory[frame_index] = {
+            data = {
                 "center_x": float(row["center_x"]),
                 "center_y": float(row["center_y"]),
                 "box_x1": float(row["box_x1"]),
@@ -83,6 +85,43 @@ def load_flock_trajectory(
                     else 0.0
                 ),
             }
+
+            if {
+                "ellipse_center_x",
+                "ellipse_center_y",
+                "ellipse_major_axis",
+                "ellipse_minor_axis",
+                "ellipse_angle",
+            }.issubset(available_columns):
+                data.update(
+                    {
+                        "ellipse_center_x": float(row["ellipse_center_x"]),
+                        "ellipse_center_y": float(row["ellipse_center_y"]),
+                        "ellipse_major_axis": float(row["ellipse_major_axis"]),
+                        "ellipse_minor_axis": float(row["ellipse_minor_axis"]),
+                        "ellipse_angle": float(row["ellipse_angle"]),
+                    }
+                )
+            else:
+                ellipse = calculate_flock_ellipse(
+                    x1=data["box_x1"],
+                    y1=data["box_y1"],
+                    x2=data["box_x2"],
+                    y2=data["box_y2"],
+                    dx=0.0,
+                    dy=0.0,
+                )
+                data.update(
+                    {
+                        "ellipse_center_x": ellipse[0],
+                        "ellipse_center_y": ellipse[1],
+                        "ellipse_major_axis": ellipse[2],
+                        "ellipse_minor_axis": ellipse[3],
+                        "ellipse_angle": ellipse[4],
+                    }
+                )
+
+            trajectory[frame_index] = data
 
     if not trajectory:
         raise RuntimeError(
@@ -111,7 +150,7 @@ def clip_point(
 
 def calculate_driving_point(
     flock_center: tuple[int, int],
-    flock_box: tuple[float, float, float, float],
+    flock_ellipse: tuple[float, float, float, float, float],
     target_point: tuple[int, int],
     safety_margin: float,
 ) -> tuple[
@@ -121,12 +160,12 @@ def calculate_driving_point(
     float,
 ]:
     """
-    Calcula una posición del robot situada fuera de la bounding box.
+    Calcula una posición del robot situada fuera de la elipse del rebaño.
 
     Pasos:
 
     1. Obtiene la dirección del centro del rebaño al destino.
-    2. Busca el borde posterior de la bounding box.
+    2. Busca el borde posterior de la elipse.
     3. Añade un margen de seguridad más allá de ese borde.
 
     Devuelve:
@@ -138,7 +177,7 @@ def calculate_driving_point(
 
     center_x, center_y = flock_center
     target_x, target_y = target_point
-    x1, y1, x2, y2 = flock_box
+    ellipse_center_x, ellipse_center_y, major_axis, minor_axis, angle = flock_ellipse
 
     vector_x = target_x - center_x
     vector_y = target_y - center_y
@@ -164,41 +203,35 @@ def calculate_driving_point(
     back_x = -unit_x
     back_y = -unit_y
 
-    box_width = max(1.0, x2 - x1)
-    box_height = max(1.0, y2 - y1)
+    major_axis = max(1.0, major_axis)
+    minor_axis = max(1.0, minor_axis)
 
-    half_width = box_width / 2.0
-    half_height = box_height / 2.0
+    angle_radians = math.radians(angle)
+    cos_angle = math.cos(angle_radians)
+    sin_angle = math.sin(angle_radians)
 
-    epsilon = 1e-6
+    # Rotamos la dirección al sistema local de la elipse.
+    local_back_x = cos_angle * back_x + sin_angle * back_y
+    local_back_y = -sin_angle * back_x + cos_angle * back_y
 
-    # Distancia necesaria para alcanzar un borde vertical.
-    distance_to_vertical_edge = (
-        half_width / abs(back_x)
-        if abs(back_x) > epsilon
-        else float("inf")
+    denominator = math.sqrt(
+        (local_back_x / major_axis) ** 2
+        + (local_back_y / minor_axis) ** 2
     )
 
-    # Distancia necesaria para alcanzar un borde horizontal.
-    distance_to_horizontal_edge = (
-        half_height / abs(back_y)
-        if abs(back_y) > epsilon
-        else float("inf")
-    )
-
-    # El primer borde que toca el vector al salir de la caja.
-    distance_to_rear_edge = min(
-        distance_to_vertical_edge,
-        distance_to_horizontal_edge,
+    distance_to_rear_edge = (
+        1.0 / denominator
+        if denominator > 1e-6
+        else 0.0
     )
 
     rear_edge_x = (
-        center_x
+        ellipse_center_x
         + back_x * distance_to_rear_edge
     )
 
     rear_edge_y = (
-        center_y
+        ellipse_center_y
         + back_y * distance_to_rear_edge
     )
 
@@ -233,7 +266,7 @@ def calculate_driving_point(
 def draw_guidance(
     frame,
     flock_center: tuple[int, int],
-    flock_box: tuple[float, float, float, float],
+    flock_ellipse: tuple[float, float, float, float, float],
     target_point: tuple[int, int],
     rear_edge_point: tuple[int, int],
     driving_point: tuple[int, int],
@@ -242,19 +275,15 @@ def draw_guidance(
     target_reached: bool,
 ) -> None:
     """
-    Dibuja la caja del rebaño, su centro, el borde posterior,
+    Dibuja la elipse del rebaño, su centro, el borde posterior,
     el destino y la posición deseada del robot.
     """
 
-    x1, y1, x2, y2 = flock_box
-
-    # Bounding box del rebaño.
-    cv2.rectangle(
-        frame,
-        (int(x1), int(y1)),
-        (int(x2), int(y2)),
-        (255, 255, 0),
-        3,
+    draw_flock_ellipse(
+        frame=frame,
+        ellipse=flock_ellipse,
+        color=(255, 255, 0),
+        thickness=3,
     )
 
     # Centro del rebaño.
@@ -568,11 +597,12 @@ def generate_guidance_video(
 
                 confidence = flock_data["confidence"]
 
-                flock_box = (
-                    flock_data["box_x1"],
-                    flock_data["box_y1"],
-                    flock_data["box_x2"],
-                    flock_data["box_y2"],
+                flock_ellipse = (
+                    flock_data["ellipse_center_x"],
+                    flock_data["ellipse_center_y"],
+                    flock_data["ellipse_major_axis"],
+                    flock_data["ellipse_minor_axis"],
+                    flock_data["ellipse_angle"],
                 )
 
                 flock_center = (
@@ -587,7 +617,7 @@ def generate_guidance_video(
                     distance_to_rear_edge,
                 ) = calculate_driving_point(
                     flock_center=flock_center,
-                    flock_box=flock_box,
+                    flock_ellipse=flock_ellipse,
                     target_point=target_point,
                     safety_margin=safety_margin,
                 )
@@ -621,7 +651,7 @@ def generate_guidance_video(
                 draw_guidance(
                     frame=frame,
                     flock_center=flock_center,
-                    flock_box=flock_box,
+                    flock_ellipse=flock_ellipse,
                     target_point=target_point,
                     rear_edge_point=rear_edge_point,
                     driving_point=driving_point,

@@ -48,6 +48,56 @@ def calculate_box_center(
     return center_x, center_y
 
 
+def calculate_flock_ellipse(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    dx: float,
+    dy: float,
+    previous_angle: float | None = None,
+    angle_dead_zone: float = 10.0,
+    angle_smoothing: float = 0.15,
+) -> tuple[float, float, float, float, float]:
+    """
+    Representa el rebaño como una elipse equivalente a la caja detectada.
+
+    Los ejes devueltos son semiejes, que es el formato que usa OpenCV.
+    El ángulo describe la forma de la caja, no la dirección de movimiento.
+    """
+
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+    width = max(1.0, x2 - x1)
+    height = max(1.0, y2 - y1)
+
+    major_axis = max(width, height) / 2.0
+    minor_axis = min(width, height) / 2.0
+    angle = 0.0 if width >= height else 90.0
+
+    return center_x, center_y, major_axis, minor_axis, angle
+
+
+def draw_flock_ellipse(
+    frame: np.ndarray,
+    ellipse: tuple[float, float, float, float, float],
+    color: tuple[int, int, int],
+    thickness: int,
+) -> None:
+    center_x, center_y, major_axis, minor_axis, angle = ellipse
+
+    cv2.ellipse(
+        frame,
+        (int(round(center_x)), int(round(center_y))),
+        (int(round(major_axis)), int(round(minor_axis))),
+        angle,
+        0,
+        360,
+        color,
+        thickness,
+    )
+
+
 def classify_direction(
     dx: float,
     dy: float,
@@ -320,6 +370,7 @@ def track_flock(
     )
 
     active_track_id: int | None = None
+    previous_ellipse_angle: float | None = None
 
     frame_index = 0
     frames_with_flock = 0
@@ -352,6 +403,11 @@ def track_flock(
                 "box_y1",
                 "box_x2",
                 "box_y2",
+                "ellipse_center_x",
+                "ellipse_center_y",
+                "ellipse_major_axis",
+                "ellipse_minor_axis",
+                "ellipse_angle",
                 "dx",
                 "dy",
                 "direction",
@@ -447,12 +503,23 @@ def track_flock(
                     dead_zone=dead_zone,
                 )
 
-                cv2.rectangle(
-                    annotated_frame,
-                    (int(x1), int(y1)),
-                    (int(x2), int(y2)),
-                    (0, 255, 0),
-                    3,
+                flock_ellipse = calculate_flock_ellipse(
+                    x1=x1,
+                    y1=y1,
+                    x2=x2,
+                    y2=y2,
+                    dx=dx,
+                    dy=dy,
+                    previous_angle=previous_ellipse_angle,
+                )
+
+                previous_ellipse_angle = flock_ellipse[4]
+
+                draw_flock_ellipse(
+                    frame=annotated_frame,
+                    ellipse=flock_ellipse,
+                    color=(0, 255, 0),
+                    thickness=3,
                 )
 
                 cv2.circle(
@@ -538,6 +605,11 @@ def track_flock(
                         int(round(y1)),
                         int(round(x2)),
                         int(round(y2)),
+                        f"{flock_ellipse[0]:.3f}",
+                        f"{flock_ellipse[1]:.3f}",
+                        f"{flock_ellipse[2]:.3f}",
+                        f"{flock_ellipse[3]:.3f}",
+                        f"{flock_ellipse[4]:.3f}",
                         f"{dx:.3f}",
                         f"{dy:.3f}",
                         direction,
@@ -561,6 +633,11 @@ def track_flock(
                     [
                         frame_index,
                         f"{current_time:.3f}",
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
                         "",
                         "",
                         "",
