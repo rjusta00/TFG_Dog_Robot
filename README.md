@@ -35,6 +35,13 @@ src/
     model.py
     simulate_robot_mpc_flock_target_predictor.py
     train_flock_target_predictor.py
+  mpc_herding/
+    cmff.py
+    config.py
+    dynamics.py
+    mpc.py
+    simulation.py
+    video_flock_only.py
 ```
 
 ## Requirements
@@ -130,6 +137,39 @@ models/flock_target_gru_flock_target_predictor.pt
 
 ```bash
 python src/flock_only_target_prediction/simulate_robot_mpc_flock_target_predictor.py --video "videos/rebano_01_1min.mp4" --detector-model "models/dogRobot_v2_best.pt" --predictor-checkpoint "models/flock_target_gru_flock_target_predictor.pt" --robot-start-x 1820 --robot-start-y 80 --initial-heading 0 --predictor-device cpu --name "flock_target_test"
+```
+
+## Video Pipeline: MPC Herding From Flock Only
+
+The `src/mpc_herding` module contains the implementation inspired by the CMFF + MPC paper. For real videos, the recommended mode is `adaptive-sweep`, because the detector provides a flock-level ellipse rather than individual sheep positions.
+
+The controller uses only class `0: flock`. Class `1: dog` can be drawn for comparison with `--draw-detected-dog`, but it is not used by the simulated dog controller.
+
+Recommended command:
+
+```bash
+python -m src.mpc_herding.video_flock_only --video "videos/rebano_01_1min.mp4" --model "models/dogRobot_v2_best.pt" --draw-detected-dog --guidance-mode adaptive-sweep --horizon 3 --synthetic-animals 80 --grid-resolution 21 --image-size 640 --driving-offset 70 --sweep-amplitude 100 --lateral-drift-gain 1.2 --robot-max-speed 180 --guidance-smoothing 0.9 --guidance-max-step 35
+```
+
+To set the target manually in image pixels, use:
+
+```bash
+python -m src.mpc_herding.video_flock_only --video "videos/rebano_01_1min.mp4" --model "models/dogRobot_v2_best.pt" --target 1850,350
+```
+
+Guidance modes:
+
+1. `adaptive-sweep`: stable video mode, behind the flock with lateral correction based on flock drift.
+2. `sweep`: behind the flock with periodic side-to-side motion.
+3. `rear`: fixed behind-the-flock point.
+4. `cmff`: closest to the paper, but noisy when only a global flock detection is available.
+
+The output video overlay is in English and shows the flock ellipse, flock center, target, driving point, and simulated dog trajectory. The flock bounding rectangle and internal synthetic points are hidden.
+
+For full details, see:
+
+```text
+src/mpc_herding/README.md
 ```
 
 ## How the Parts Connect
