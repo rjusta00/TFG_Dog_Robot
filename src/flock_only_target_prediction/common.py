@@ -343,8 +343,20 @@ def denormalize_target(
 ) -> tuple[float, float]:
     current_row = enrich_row_with_rear_direction(current_row)
     rear_scale, lateral_scale, _ = get_ellipse_parameters(current_row)
-    rear_distance = max(0.15, float(prediction[0]))
+    rear_distance = float(prediction[0])
     lateral_offset = max(-1.25, min(1.25, float(prediction[1])))
+
+    # Keep the target outside the flock ellipse without forcing it behind it.
+    normalized_distance = math.hypot(rear_distance, lateral_offset)
+    minimum_distance = 1.05
+    if normalized_distance < minimum_distance:
+        if normalized_distance < 1e-6:
+            rear_distance = minimum_distance
+            lateral_offset = 0.0
+        else:
+            scale = minimum_distance / normalized_distance
+            rear_distance *= scale
+            lateral_offset *= scale
 
     rear_x = float(current_row["rear_direction_x"])
     rear_y = float(current_row["rear_direction_y"])
