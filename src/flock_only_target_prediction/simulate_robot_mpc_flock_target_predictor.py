@@ -28,6 +28,7 @@ from flock_only_target_prediction.common import (
     select_main_flock,
 )
 from flock_only_target_prediction.model import FlockTargetGRUPredictor
+from evaluation_metrics import METRIC_COLUMNS, build_spatial_metrics, select_closest_dog
 from simulate_robot_mpc import (
     build_reference_horizon,
     clamp,
@@ -38,6 +39,46 @@ from simulate_robot_mpc import (
     update_state,
 )
 from track_flock_motion import calculate_flock_ellipse, draw_flock_ellipse
+
+
+def extract_dog_candidates(result) -> list[dict]:
+    if result.boxes is None or len(result.boxes) == 0:
+        return []
+
+    boxes = result.boxes.xyxy.cpu().numpy()
+    class_ids = result.boxes.cls.cpu().numpy().astype(int)
+    track_ids = None if result.boxes.id is None else result.boxes.id.cpu().numpy().astype(int)
+    dogs = []
+    for index, box in enumerate(boxes):
+        if class_ids[index] != 1 or track_ids is None:
+            continue
+        x1, y1, x2, y2 = box.tolist()
+        dogs.append({"track_id": int(track_ids[index]), "center": ((x1 + x2) * 0.5, (y1 + y2) * 0.5)})
+    return dogs
+
+
+def build_future_dog_paths(detections: dict[int, list[dict]], lookahead_frames: int = 30) -> dict[int, dict[int, list[tuple[int, int]]]]:
+    paths: dict[int, dict[int, list[tuple[int, int]]]] = {}
+    for frame_index, dogs in detections.items():
+        paths[frame_index] = {}
+        for dog in dogs:
+            track_id = dog["track_id"]
+            points = []
+            for future_frame in range(frame_index, frame_index + lookahead_frames + 1):
+                future_dog = next((item for item in detections.get(future_frame, []) if item["track_id"] == track_id), None)
+                if future_dog is not None:
+                    x, y = future_dog["center"]
+                    points.append((int(round(x)), int(round(y))))
+            if len(points) >= 2:
+                paths[frame_index][track_id] = points
+    return paths
+
+
+def draw_future_dog_paths(frame: np.ndarray, paths: dict[int, list[tuple[int, int]]]) -> None:
+    for track_id, points in paths.items():
+        cv2.polylines(frame, [np.array(points, dtype=np.int32).reshape((-1, 1, 2))], False, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(frame, points[0], 5, (0, 255, 255), -1)
+        cv2.putText(frame, f"Detected dog {track_id}: next frames", (points[0][0] + 8, points[0][1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2, cv2.LINE_AA)
 
 
 def build_startup_control(
@@ -143,7 +184,7 @@ def build_guidance_from_flock_predictor(
     image_size: int,
     predictor_device: str,
     single_flock: bool,
-) -> tuple[dict[int, dict], float, int, int, int]:
+) -> tuple[dict[int, dict], dict[int, list[dict]], dict[int, dict[int, list[tuple[int, int]]]], float, int, int, int]:
     video_path = resolve_project_path(video_path)
     detector_model_path = resolve_project_path(detector_model_path)
     predictor_checkpoint_path = resolve_project_path(predictor_checkpoint_path)
@@ -196,6 +237,7 @@ def build_guidance_from_flock_predictor(
     rear_direction_source = "UNKNOWN"
     ellipse_trajectory: deque[tuple[int, int]] = deque(maxlen=30)
     guidance: dict[int, dict] = {}
+    dog_detections: dict[int, list[dict]] = {}
     frame_index = 0
 
     while True:
@@ -207,12 +249,14 @@ def build_guidance_from_flock_predictor(
             source=frame,
             persist=True,
             tracker="botsort.yaml",
-            classes=[0],
+            classes=[0, 1],
             conf=confidence,
             iou=0.5,
             imgsz=image_size,
             verbose=False,
         )[0]
+
+        dog_detections[frame_index] = extract_dog_candidates(result)
 
         flock_candidates = extract_flock_candidates(result)
         selected_flock = select_main_flock(
@@ -355,7 +399,7 @@ def build_guidance_from_flock_predictor(
     if not guidance:
         raise RuntimeError("No guidance could be generated from the flock-only predictor.")
 
-    return guidance, fps, width, height, total_frames
+    return guidance, dog_detections, build_future_dog_paths(dog_detections), fps, width, height, total_frames
 
 
 def draw_overlay(frame: np.ndarray, data: dict) -> None:
@@ -419,7 +463,7 @@ def simulate_robot_mpc_flock_target_predictor(
     single_flock: bool,
     run_name: str,
 ) -> None:
-    guidance, fps, width, height, total_frames = build_guidance_from_flock_predictor(
+    guidance, dog_detections, future_dog_paths, fps, width, height, total_frames = build_guidance_from_flock_predictor(
         video_path,
         detector_model_path,
         predictor_checkpoint_path,
@@ -478,7 +522,8 @@ def simulate_robot_mpc_flock_target_predictor(
 
     with output_csv.open("w", encoding="utf-8", newline="") as csv_file:
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow(["frame", "time_seconds", "robot_x", "robot_y", "theta_degrees", "velocity", "omega_degrees", "target_x", "target_y", "desired_x", "desired_y", "distance_to_desired", "status", "rear_direction_x", "rear_direction_y", "rear_direction_confidence", "rear_direction_source", "mpc_cost", "optimizer_success", "optimizer_iterations"])
+        base_columns = ["frame", "time_seconds", "robot_x", "robot_y", "theta_degrees", "velocity", "omega_degrees", "target_x", "target_y", "desired_x", "desired_y", "distance_to_desired", "status", "rear_direction_x", "rear_direction_y", "rear_direction_confidence", "rear_direction_source", "mpc_cost", "optimizer_success", "optimizer_iterations"]
+        csv_writer.writerow(base_columns + METRIC_COLUMNS)
 
         while True:
             success, frame = capture.read()
@@ -538,6 +583,7 @@ def simulate_robot_mpc_flock_target_predictor(
                 distance_to_desired = math.hypot(float(data["desired_x"]) - float(state[0]), float(data["desired_y"]) - float(state[1]))
 
                 draw_overlay(frame, data)
+                draw_future_dog_paths(frame, future_dog_paths.get(frame_index, {}))
                 draw_reference_trajectory(frame, last_reference_points)
                 draw_predicted_trajectory(frame, last_predicted_states)
 
@@ -567,7 +613,14 @@ def simulate_robot_mpc_flock_target_predictor(
                 if mpc_updated:
                     cv2.putText(frame, "MPC UPDATED", (30, 45 + len(lines) * 40), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2, cv2.LINE_AA)
 
-                csv_writer.writerow([frame_index, f"{frame_index / fps:.3f}", f"{state[0]:.3f}", f"{state[1]:.3f}", f"{theta_degrees:.3f}", f"{current_control[0]:.3f}", f"{omega_degrees:.3f}", f"{data['target_x']:.3f}", f"{data['target_y']:.3f}", f"{data['desired_x']:.3f}", f"{data['desired_y']:.3f}", f"{distance_to_desired:.3f}", data["status"], f"{float(data.get('rear_direction_x', 0.0)):.6f}", f"{float(data.get('rear_direction_y', 0.0)):.6f}", f"{float(data.get('rear_direction_confidence', 0.0)):.6f}", data.get("rear_direction_source", ""), f"{last_mpc_cost:.8f}", last_optimizer_success, last_optimizer_iterations])
+                current_guidance = guidance.get(frame_index)
+                flock_center = None if current_guidance is None else (float(current_guidance["flock_x"]), float(current_guidance["flock_y"]))
+                mpc_point = None if current_guidance is None else (float(current_guidance["desired_x"]), float(current_guidance["desired_y"]))
+                flock_scale = None if current_guidance is None else max(float(current_guidance["flock_ellipse_major_axis"]), float(current_guidance["flock_ellipse_minor_axis"]))
+                selected_dog = select_closest_dog(dog_detections.get(frame_index, []), mpc_point)
+                metrics = build_spatial_metrics("flock_only_target_prediction", selected_dog, flock_center, mpc_point, flock_scale)
+                base_values = [frame_index, f"{frame_index / fps:.3f}", f"{state[0]:.3f}", f"{state[1]:.3f}", f"{theta_degrees:.3f}", f"{current_control[0]:.3f}", f"{omega_degrees:.3f}", f"{data['target_x']:.3f}", f"{data['target_y']:.3f}", f"{data['desired_x']:.3f}", f"{data['desired_y']:.3f}", f"{distance_to_desired:.3f}", data["status"], f"{float(data.get('rear_direction_x', 0.0)):.6f}", f"{float(data.get('rear_direction_y', 0.0)):.6f}", f"{float(data.get('rear_direction_confidence', 0.0)):.6f}", data.get("rear_direction_source", ""), f"{last_mpc_cost:.8f}", last_optimizer_success, last_optimizer_iterations]
+                csv_writer.writerow(base_values + [metrics[column] for column in METRIC_COLUMNS])
 
             video_writer.write(frame)
             frame_index += 1

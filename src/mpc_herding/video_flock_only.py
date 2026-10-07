@@ -23,6 +23,7 @@ from .cmff import CMFFGuidance
 from .config import CMFFConfig, DynamicsConfig, MPCConfig
 from .dynamics import SelfOrganizationRule
 from .mpc import MPCController, RobotState
+from ..evaluation_metrics import build_spatial_metrics, select_closest_dog
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -79,6 +80,46 @@ def select_tracked_candidate(candidates: list[dict], active_track_id: int | None
             if candidate["track_id"] == active_track_id:
                 return candidate
     return max(candidates, key=lambda candidate: candidate["area"])
+
+
+def collect_future_dog_paths(video_path: Path, model_path: Path, args: argparse.Namespace) -> dict[int, dict[int, list[tuple[int, int]]]]:
+    """Collect real dog tracks before rendering so each frame can show future detections."""
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise RuntimeError(f"Cannot open video: {video_path}")
+
+    tracker = YOLO(str(model_path))
+    detections: dict[int, list[dict]] = {}
+    frame_index = 0
+    while True:
+        success, frame = capture.read()
+        if not success or (args.max_frames is not None and frame_index >= args.max_frames):
+            break
+        result = tracker.track(source=frame, persist=True, tracker="botsort.yaml", classes=[1], conf=args.confidence, iou=args.iou, imgsz=args.image_size, verbose=False)[0]
+        detections[frame_index] = [dog for dog in extract_candidates(result, class_id=1) if dog["track_id"] is not None]
+        frame_index += 1
+    capture.release()
+
+    paths: dict[int, dict[int, list[tuple[int, int]]]] = {}
+    for current_frame, dogs in detections.items():
+        frame_paths: dict[int, list[tuple[int, int]]] = {}
+        for dog in dogs:
+            points = []
+            for future_frame in range(current_frame, current_frame + args.detected_dog_trajectory_frames + 1):
+                match = next((item for item in detections.get(future_frame, []) if item["track_id"] == dog["track_id"]), None)
+                if match is not None:
+                    points.append(tuple(np.round(match["center"]).astype(int)))
+            if len(points) >= 2:
+                frame_paths[dog["track_id"]] = points
+        paths[current_frame] = frame_paths
+    return paths
+
+
+def draw_future_dog_paths(frame: np.ndarray, paths: dict[int, list[tuple[int, int]]]) -> None:
+    for track_id, points in paths.items():
+        cv2.polylines(frame, [np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))], False, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(frame, points[0], 5, (0, 255, 255), -1)
+        draw_label(frame, f"Dog {track_id}: next frames", (points[0][0] + 8, points[0][1] - 8), (0, 255, 255))
 
 
 def build_ellipse_particles(
@@ -256,6 +297,8 @@ def simulate_video_flock_only(
     if fps <= 0:
         fps = 30.0
     dt = args.dt if args.dt is not None else 1.0 / fps
+    control_interval_frames = max(1, int(round(args.control_period * fps)))
+    control_dt = control_interval_frames / fps
 
     output_video_path.parent.mkdir(parents=True, exist_ok=True)
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -276,6 +319,7 @@ def simulate_video_flock_only(
     print(f"Model: {model_path}", flush=True)
     print(f"Frames: {total_frames}", flush=True)
     print(f"FPS: {fps:.3f}", flush=True)
+    print(f"MPC control period: {control_dt:.3f} s", flush=True)
     print(f"Detector: {'track + BoT-SORT' if args.use_tracker else 'predict'}", flush=True)
     print(f"Guidance mode: {args.guidance_mode}", flush=True)
     print(f"Output video: {output_video_path}", flush=True)
@@ -285,6 +329,11 @@ def simulate_video_flock_only(
     target = target_from_args(args, width, height)
     model = YOLO(str(model_path))
     print("YOLO model loaded.", flush=True)
+    if args.draw_detected_dog:
+        print("Collecting future detected-dog trajectories...", flush=True)
+        future_dog_paths = collect_future_dog_paths(video_path, model_path, args)
+    else:
+        future_dog_paths = {}
     dynamics_config = DynamicsConfig(
         animal_sensing_radius=args.animal_sensing_radius,
         robot_sensing_radius=args.robot_sensing_radius,
@@ -303,7 +352,7 @@ def simulate_video_flock_only(
     )
     mpc_config = MPCConfig(
         horizon=args.horizon,
-        dt=dt,
+        dt=control_dt,
         min_speed=0.0,
         max_speed=args.robot_max_speed,
         max_omega=args.robot_max_omega,
@@ -329,7 +378,36 @@ def simulate_video_flock_only(
     last_velocities: np.ndarray | None = None
     robot_trajectory: deque[tuple[int, int]] = deque(maxlen=args.trail_length)
     rows: list[dict] = []
+    current_control = np.zeros(2, dtype=float)
+    next_control_frame = 0
+    last_optimizer_success = False
+    last_optimizer_cost = float("nan")
+    last_control_recovery = False
     frame_index = 0
+
+    def solve_control(
+        robot: RobotState,
+        positions: np.ndarray,
+        velocities: np.ndarray,
+        driving_point: np.ndarray,
+    ) -> tuple[np.ndarray, bool, float, bool]:
+        control, optimizer_success, optimizer_cost = controller.solve(
+            robot_state=robot,
+            herd_positions=positions,
+            herd_velocities=velocities,
+            target=target,
+            obstacles=np.empty((0, 2), dtype=float),
+            driving_point_override=driving_point,
+        )
+        stalled = (
+            np.linalg.norm(driving_point - robot.position) > args.stall_distance
+            and abs(control[0]) < args.stall_speed
+            and abs(control[1]) < args.stall_angular_speed
+        )
+        if stalled:
+            control = controller.fallback_control(robot, driving_point)
+
+        return control, optimizer_success, optimizer_cost, stalled
 
     print()
 
@@ -350,7 +428,7 @@ def simulate_video_flock_only(
                 source=frame,
                 persist=True,
                 tracker="botsort.yaml",
-                classes=[0, 1] if args.draw_detected_dog else [0],
+                classes=[0, 1],
                 conf=args.confidence,
                 iou=args.iou,
                 imgsz=args.image_size,
@@ -359,7 +437,7 @@ def simulate_video_flock_only(
         else:
             result = model.predict(
                 source=frame,
-                classes=[0, 1] if args.draw_detected_dog else [0],
+                classes=[0, 1],
                 conf=args.confidence,
                 iou=args.iou,
                 imgsz=args.image_size,
@@ -371,11 +449,13 @@ def simulate_video_flock_only(
 
         flock_candidates = extract_candidates(result, class_id=0)
         selected_flock = select_tracked_candidate(flock_candidates, active_flock_track_id)
-        detected_dogs = extract_candidates(result, class_id=1) if args.draw_detected_dog else []
+        detected_dogs = extract_candidates(result, class_id=1)
 
         status = "NO_FLOCK"
-        optimizer_success = False
-        optimizer_cost = float("nan")
+        optimizer_success = last_optimizer_success
+        optimizer_cost = last_optimizer_cost
+        control_recovery = last_control_recovery
+        control_seconds = 0.0
         guidance = None
         raw_driving_point = None
         rear_direction = None
@@ -426,15 +506,21 @@ def simulate_video_flock_only(
                 smoothing=args.guidance_smoothing,
                 max_step=args.guidance_max_step,
             )
-            control, optimizer_success, optimizer_cost = controller.solve(
-                robot_state=robot_state,
-                herd_positions=positions,
-                herd_velocities=velocities,
-                target=target,
-                obstacles=np.empty((0, 2), dtype=float),
-                driving_point_override=smoothed_driving_point,
+            if frame_index >= next_control_frame:
+                current_control, optimizer_success, optimizer_cost, control_recovery = solve_control(
+                    robot_state,
+                    positions,
+                    velocities,
+                    smoothed_driving_point,
+                )
+                last_optimizer_success = optimizer_success
+                last_optimizer_cost = optimizer_cost
+                last_control_recovery = control_recovery
+                next_control_frame = frame_index + control_interval_frames
+                control_seconds = time.perf_counter() - control_start_time
+            robot_state = RobotState.from_array(
+                controller.step_robot_state(robot_state.as_array(), current_control, dt=dt)
             )
-            robot_state = RobotState.from_array(controller.step_robot_state(robot_state.as_array(), control))
             robot_state = RobotState(
                 x=float(np.clip(robot_state.x, 0, width - 1)),
                 y=float(np.clip(robot_state.y, 0, height - 1)),
@@ -443,7 +529,8 @@ def simulate_video_flock_only(
                 omega=robot_state.omega,
             )
             status = f"{args.guidance_mode.upper()}_MPC"
-            control_seconds = time.perf_counter() - control_start_time
+            if control_recovery:
+                status += "_RECOVERY"
             if args.debug_timing:
                 print(f"  frame {frame_index}: guidance+MPC finished in {control_seconds:.2f}s", flush=True)
         elif robot_state is not None and last_positions is not None and last_velocities is not None:
@@ -472,17 +559,24 @@ def simulate_video_flock_only(
                 smoothing=args.guidance_smoothing,
                 max_step=args.guidance_max_step,
             )
-            control, optimizer_success, optimizer_cost = controller.solve(
-                robot_state=robot_state,
-                herd_positions=last_positions,
-                herd_velocities=last_velocities,
-                target=target,
-                obstacles=np.empty((0, 2), dtype=float),
-                driving_point_override=smoothed_driving_point,
+            if frame_index >= next_control_frame:
+                current_control, optimizer_success, optimizer_cost, control_recovery = solve_control(
+                    robot_state,
+                    last_positions,
+                    last_velocities,
+                    smoothed_driving_point,
+                )
+                last_optimizer_success = optimizer_success
+                last_optimizer_cost = optimizer_cost
+                last_control_recovery = control_recovery
+                next_control_frame = frame_index + control_interval_frames
+                control_seconds = time.perf_counter() - control_start_time
+            robot_state = RobotState.from_array(
+                controller.step_robot_state(robot_state.as_array(), current_control, dt=dt)
             )
-            robot_state = RobotState.from_array(controller.step_robot_state(robot_state.as_array(), control))
             status = f"LAST_FLOCK_{args.guidance_mode.upper()}"
-            control_seconds = time.perf_counter() - control_start_time
+            if control_recovery:
+                status += "_RECOVERY"
             if args.debug_timing:
                 print(f"  frame {frame_index}: guidance+MPC finished in {control_seconds:.2f}s", flush=True)
         else:
@@ -539,11 +633,13 @@ def simulate_video_flock_only(
                     2,
                 )
 
-        for dog in detected_dogs:
-            x1, y1, x2, y2 = dog["box"]
-            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (80, 80, 255), 2)
-            cv2.circle(annotated, tuple(np.round(dog["center"]).astype(int)), 4, (80, 80, 255), -1)
-            draw_label(annotated, "detected dog (not used)", (int(x1), max(18, int(y1) - 6)), (80, 80, 255))
+        if args.draw_detected_dog:
+            for dog in detected_dogs:
+                x1, y1, x2, y2 = dog["box"]
+                cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (80, 80, 255), 2)
+                cv2.circle(annotated, tuple(np.round(dog["center"]).astype(int)), 4, (80, 80, 255), -1)
+                draw_label(annotated, "detected dog (not used)", (int(x1), max(18, int(y1) - 6)), (80, 80, 255))
+        draw_future_dog_paths(annotated, future_dog_paths.get(frame_index, {}))
 
         if robot_state is not None:
             robot_trajectory.append((int(round(robot_state.x)), int(round(robot_state.y))))
@@ -556,6 +652,11 @@ def simulate_video_flock_only(
         draw_label(annotated, "Control uses flock detections only", (15, 55), (255, 255, 255))
         writer.write(annotated)
 
+        flock_center = None if selected_flock is None else (float(previous_center[0]), float(previous_center[1]))
+        flock_scale = None if selected_flock is None else float(max(previous_axes))
+        mpc_point = None if smoothed_driving_point is None else (float(smoothed_driving_point[0]), float(smoothed_driving_point[1]))
+        selected_dog = select_closest_dog(detected_dogs, mpc_point)
+        metrics = build_spatial_metrics("mpc_herding", selected_dog, flock_center, mpc_point, flock_scale)
         rows.append(
             {
                 "frame": frame_index,
@@ -567,6 +668,9 @@ def simulate_video_flock_only(
                 "robot_theta": "" if robot_state is None else f"{robot_state.theta:.6f}",
                 "robot_v": "" if robot_state is None else f"{robot_state.v:.3f}",
                 "robot_omega": "" if robot_state is None else f"{robot_state.omega:.6f}",
+                "control_v": f"{current_control[0]:.3f}",
+                "control_omega": f"{current_control[1]:.6f}",
+                "control_recovery": int(control_recovery),
                 "target_x": f"{target[0]:.3f}",
                 "target_y": f"{target[1]:.3f}",
                 "flock_center_x": "" if previous_center is None else f"{previous_center[0]:.3f}",
@@ -582,6 +686,7 @@ def simulate_video_flock_only(
                 "escape_detected": "" if guidance is None else int(guidance.escape_detected),
                 "optimizer_success": int(optimizer_success),
                 "optimizer_cost": "" if math.isnan(optimizer_cost) else f"{optimizer_cost:.6f}",
+                **metrics,
             }
         )
 
@@ -624,7 +729,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-size", type=int, default=640)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--dt", type=float, default=None)
+    parser.add_argument("--control-period", type=float, default=0.1, help="Seconds between MPC optimizations; control is held between updates.")
     parser.add_argument("--draw-detected-dog", action="store_true")
+    parser.add_argument("--detected-dog-trajectory-frames", type=int, default=30, help="Number of future frames shown for each detected dog.")
     parser.add_argument("--use-tracker", action="store_true", help="Use YOLO.track + BoT-SORT. Default uses faster YOLO.predict.")
     parser.add_argument("--progress-interval", type=int, default=10)
     parser.add_argument("--debug-timing", action="store_true")
@@ -663,6 +770,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--w-centroid-target", type=float, default=0.3)
     parser.add_argument("--w-energy", type=float, default=0.1)
     parser.add_argument("--max-iterations", type=int, default=50)
+    parser.add_argument("--stall-distance", type=float, default=30.0, help="Distance to the driving point above which a stationary MPC result is recovered.")
+    parser.add_argument("--stall-speed", type=float, default=1.0, help="Maximum linear speed considered stationary in px/s.")
+    parser.add_argument("--stall-angular-speed", type=float, default=0.05, help="Maximum angular speed considered stationary in rad/s.")
     parser.add_argument("--initial-robot-offset-scale", type=float, default=1.4)
     parser.add_argument("--trail-length", type=int, default=240)
     return parser

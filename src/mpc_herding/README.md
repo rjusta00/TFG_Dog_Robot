@@ -100,8 +100,9 @@ python -m src.mpc_herding.video_flock_only `
 
 Outputs:
 
-- Annotated MP4 with flock ellipse, flock center, target, driving point, detected real dog boxes if requested, and simulated dog trajectory.
+- Annotated MP4 with flock ellipse, flock center, target, driving point, the next detected positions of each real dog (yellow), detected real dog boxes if requested, and simulated dog trajectory.
 - CSV with per-frame robot state, target, flock center, driving point, optional CMFF fields, and optimizer status.
+- The CSV also includes dog, flock, and MPC driving-point distances in pixels and normalized flock units. These metrics do not add any overlay to the output video.
 - By default, outputs are written to `runs/mpc_herding/`.
 
 ### Current Limitations
