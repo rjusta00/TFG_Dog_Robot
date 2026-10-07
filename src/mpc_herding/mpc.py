@@ -50,8 +50,13 @@ class MPCController:
         self.rule = rule
         self.previous_solution: np.ndarray | None = None
 
-    def step_robot_state(self, state: np.ndarray, control: np.ndarray) -> np.ndarray:
-        dt = self.mpc_config.dt
+    def step_robot_state(
+        self,
+        state: np.ndarray,
+        control: np.ndarray,
+        dt: float | None = None,
+    ) -> np.ndarray:
+        dt = self.mpc_config.dt if dt is None else dt
         v, omega = control
         return np.array(
             [
