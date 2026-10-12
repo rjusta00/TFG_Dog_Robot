@@ -4,6 +4,7 @@ import argparse
 import csv
 import math
 import time
+import tracemalloc
 from collections import deque
 from pathlib import Path
 
@@ -23,12 +24,20 @@ from .cmff import CMFFGuidance
 from .config import CMFFConfig, DynamicsConfig, MPCConfig
 from .dynamics import SelfOrganizationRule
 from .mpc import MPCController, RobotState
+from ..gpu_telemetry import GPU_TELEMETRY_COLUMNS, GpuTelemetryMonitor, gpu_index
 from ..evaluation_metrics import build_spatial_metrics, select_closest_dog
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL_PATH = PROJECT_ROOT / "models" / "dogRobot_v2_best.pt"
 OUTPUT_ROOT = PROJECT_ROOT / "runs" / "mpc_herding"
+PERFORMANCE_COLUMNS = (
+    "inference_seconds",
+    "control_seconds",
+    "frame_seconds",
+    "python_memory_peak_mb",
+    "control_energy_proxy",
+)
 
 
 def resolve_project_path(path: Path) -> Path:
@@ -95,7 +104,7 @@ def collect_future_dog_paths(video_path: Path, model_path: Path, args: argparse.
         success, frame = capture.read()
         if not success or (args.max_frames is not None and frame_index >= args.max_frames):
             break
-        result = tracker.track(source=frame, persist=True, tracker="botsort.yaml", classes=[1], conf=args.confidence, iou=args.iou, imgsz=args.image_size, verbose=False)[0]
+        result = tracker.track(source=frame, persist=True, tracker="botsort.yaml", classes=[1], conf=args.confidence, iou=args.iou, imgsz=args.image_size, device=args.device, verbose=False)[0]
         detections[frame_index] = [dog for dog in extract_candidates(result, class_id=1) if dog["track_id"] is not None]
         frame_index += 1
     capture.release()
@@ -286,6 +295,12 @@ def simulate_video_flock_only(
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    gpu_monitor = GpuTelemetryMonitor(gpu_index(args.device))
+    gpu_monitor.start()
+
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -432,6 +447,7 @@ def simulate_video_flock_only(
                 conf=args.confidence,
                 iou=args.iou,
                 imgsz=args.image_size,
+                device=args.device,
                 verbose=False,
             )[0]
         else:
@@ -441,6 +457,7 @@ def simulate_video_flock_only(
                 conf=args.confidence,
                 iou=args.iou,
                 imgsz=args.image_size,
+                device=args.device,
                 verbose=False,
             )[0]
         detection_seconds = time.perf_counter() - detection_start_time
@@ -657,6 +674,10 @@ def simulate_video_flock_only(
         mpc_point = None if smoothed_driving_point is None else (float(smoothed_driving_point[0]), float(smoothed_driving_point[1]))
         selected_dog = select_closest_dog(detected_dogs, mpc_point)
         metrics = build_spatial_metrics("mpc_herding", selected_dog, flock_center, mpc_point, flock_scale)
+        _, peak_memory_bytes = tracemalloc.get_traced_memory()
+        gpu_metrics = gpu_monitor.snapshot()
+        # This is a unitless quadratic control-effort proxy, not electrical energy.
+        control_energy_proxy = (current_control[0] ** 2 + current_control[1] ** 2) * dt
         rows.append(
             {
                 "frame": frame_index,
@@ -686,6 +707,12 @@ def simulate_video_flock_only(
                 "escape_detected": "" if guidance is None else int(guidance.escape_detected),
                 "optimizer_success": int(optimizer_success),
                 "optimizer_cost": "" if math.isnan(optimizer_cost) else f"{optimizer_cost:.6f}",
+                "inference_seconds": f"{detection_seconds:.6f}",
+                "control_seconds": f"{control_seconds:.6f}",
+                "frame_seconds": f"{time.perf_counter() - frame_start_time:.6f}",
+                "python_memory_peak_mb": f"{peak_memory_bytes / (1024.0 ** 2):.3f}",
+                "control_energy_proxy": f"{control_energy_proxy:.6f}",
+                **{column: f"{gpu_metrics[column]:.6f}" for column in GPU_TELEMETRY_COLUMNS},
                 **metrics,
             }
         )
@@ -705,17 +732,35 @@ def simulate_video_flock_only(
     capture.release()
     writer.release()
 
+    gpu_monitor.stop()
+    if rows:
+        rows[-1].update({column: f"{value:.6f}" for column, value in gpu_monitor.snapshot().items()})
+    performance_csv_path = output_csv_path.with_name(f"{output_csv_path.stem}_performance.csv")
     with output_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
         if rows:
-            writer_csv = csv.DictWriter(csv_file, fieldnames=list(rows[0].keys()))
+            performance_columns = (*PERFORMANCE_COLUMNS, *GPU_TELEMETRY_COLUMNS)
+            spatial_columns = [column for column in rows[0] if column not in performance_columns]
+            writer_csv = csv.DictWriter(csv_file, fieldnames=spatial_columns)
             writer_csv.writeheader()
-            writer_csv.writerows(rows)
+            writer_csv.writerows([{column: row[column] for column in spatial_columns} for row in rows])
+
+    with performance_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        performance_columns = (*PERFORMANCE_COLUMNS, *GPU_TELEMETRY_COLUMNS)
+        writer_csv = csv.DictWriter(csv_file, fieldnames=["frame", *performance_columns])
+        writer_csv.writeheader()
+        writer_csv.writerows(
+            [{"frame": row["frame"], **{column: row[column] for column in performance_columns}} for row in rows]
+        )
+
+    if started_tracing:
+        tracemalloc.stop()
 
     print("=" * 70, flush=True)
     print("Simulation finished", flush=True)
     print(f"Processed frames: {frame_index}", flush=True)
     print(f"Video: {output_video_path}", flush=True)
     print(f"CSV: {output_csv_path}", flush=True)
+    print(f"Performance CSV: {performance_csv_path}", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -727,6 +772,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.5)
     parser.add_argument("--image-size", type=int, default=640)
+    parser.add_argument("--device", type=str, default="0", help="CUDA device used by YOLO, for example 0 or cuda:0.")
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--dt", type=float, default=None)
     parser.add_argument("--control-period", type=float, default=0.1, help="Seconds between MPC optimizations; control is held between updates.")

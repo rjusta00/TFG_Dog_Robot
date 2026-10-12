@@ -2,6 +2,8 @@ import argparse
 import csv
 import math
 import sys
+import time
+import tracemalloc
 from collections import deque
 from pathlib import Path
 
@@ -29,6 +31,7 @@ from flock_only_target_prediction.common import (
 )
 from flock_only_target_prediction.model import FlockTargetGRUPredictor
 from evaluation_metrics import METRIC_COLUMNS, build_spatial_metrics, select_closest_dog
+from gpu_telemetry import GPU_TELEMETRY_COLUMNS, GpuTelemetryMonitor, gpu_index
 from simulate_robot_mpc import (
     build_reference_horizon,
     clamp,
@@ -183,8 +186,9 @@ def build_guidance_from_flock_predictor(
     confidence: float,
     image_size: int,
     predictor_device: str,
+    detector_device: str,
     single_flock: bool,
-) -> tuple[dict[int, dict], dict[int, list[dict]], dict[int, dict[int, list[tuple[int, int]]]], float, int, int, int]:
+) -> tuple[dict[int, dict], dict[int, list[dict]], dict[int, dict[int, list[tuple[int, int]]]], dict[int, float], dict[int, bool], float, int, int, int]:
     video_path = resolve_project_path(video_path)
     detector_model_path = resolve_project_path(detector_model_path)
     predictor_checkpoint_path = resolve_project_path(predictor_checkpoint_path)
@@ -237,13 +241,16 @@ def build_guidance_from_flock_predictor(
     rear_direction_source = "UNKNOWN"
     ellipse_trajectory: deque[tuple[int, int]] = deque(maxlen=30)
     guidance: dict[int, dict] = {}
+    guidance_seconds: dict[int, float] = {}
     dog_detections: dict[int, list[dict]] = {}
+    flock_detected: dict[int, bool] = {}
     frame_index = 0
 
     while True:
         success, frame = capture.read()
         if not success:
             break
+        frame_start_time = time.perf_counter()
 
         result = detector.track(
             source=frame,
@@ -253,6 +260,7 @@ def build_guidance_from_flock_predictor(
             conf=confidence,
             iou=0.5,
             imgsz=image_size,
+            device=detector_device,
             verbose=False,
         )[0]
 
@@ -264,6 +272,7 @@ def build_guidance_from_flock_predictor(
             active_track_id=active_flock_track_id,
             single_flock=single_flock,
         )
+        flock_detected[frame_index] = selected_flock is not None
 
         if selected_flock is not None:
             active_flock_track_id = selected_flock["track_id"]
@@ -350,6 +359,7 @@ def build_guidance_from_flock_predictor(
                 status = "PREDICTED_FROM_FLOCK"
             else:
                 previous_row = {**current_row, "frame_index": frame_index}
+                guidance_seconds[frame_index] = time.perf_counter() - frame_start_time
                 frame_index += 1
 
                 if frame_index % 150 == 0:
@@ -389,6 +399,7 @@ def build_guidance_from_flock_predictor(
             ellipse_trajectory.clear()
             previous_row = None
 
+        guidance_seconds[frame_index] = time.perf_counter() - frame_start_time
         frame_index += 1
 
         if frame_index % 150 == 0:
@@ -399,7 +410,7 @@ def build_guidance_from_flock_predictor(
     if not guidance:
         raise RuntimeError("No guidance could be generated from the flock-only predictor.")
 
-    return guidance, dog_detections, build_future_dog_paths(dog_detections), fps, width, height, total_frames
+    return guidance, dog_detections, build_future_dog_paths(dog_detections), guidance_seconds, flock_detected, fps, width, height, total_frames
 
 
 def draw_overlay(frame: np.ndarray, data: dict) -> None:
@@ -460,16 +471,24 @@ def simulate_robot_mpc_flock_target_predictor(
     confidence: float,
     image_size: int,
     predictor_device: str,
+    detector_device: str,
     single_flock: bool,
     run_name: str,
 ) -> None:
-    guidance, dog_detections, future_dog_paths, fps, width, height, total_frames = build_guidance_from_flock_predictor(
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    gpu_monitor = GpuTelemetryMonitor(gpu_index(detector_device))
+    gpu_monitor.start()
+
+    guidance, dog_detections, future_dog_paths, guidance_seconds, flock_detected, fps, width, height, total_frames = build_guidance_from_flock_predictor(
         video_path,
         detector_model_path,
         predictor_checkpoint_path,
         confidence,
         image_size,
         predictor_device,
+        detector_device,
         single_flock,
     )
 
@@ -489,6 +508,7 @@ def simulate_robot_mpc_flock_target_predictor(
     output_directory.mkdir(parents=True, exist_ok=True)
     output_video = output_directory / f"{Path(video_path).stem}_flock_target_mpc.mp4"
     output_csv = output_directory / f"{Path(video_path).stem}_flock_target_mpc.csv"
+    performance_csv = output_directory / f"{Path(video_path).stem}_flock_target_mpc_performance.csv"
 
     video_writer = cv2.VideoWriter(str(output_video), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
@@ -522,13 +542,14 @@ def simulate_robot_mpc_flock_target_predictor(
 
     with output_csv.open("w", encoding="utf-8", newline="") as csv_file:
         csv_writer = csv.writer(csv_file)
-        base_columns = ["frame", "time_seconds", "robot_x", "robot_y", "theta_degrees", "velocity", "omega_degrees", "target_x", "target_y", "desired_x", "desired_y", "distance_to_desired", "status", "rear_direction_x", "rear_direction_y", "rear_direction_confidence", "rear_direction_source", "mpc_cost", "optimizer_success", "optimizer_iterations"]
+        base_columns = ["frame", "time_seconds", "robot_x", "robot_y", "theta_degrees", "velocity", "omega_degrees", "target_x", "target_y", "desired_x", "desired_y", "distance_to_desired", "status", "flock_detected", "dog_detections", "rear_direction_x", "rear_direction_y", "rear_direction_confidence", "rear_direction_source", "mpc_cost", "optimizer_success", "optimizer_iterations", "inference_seconds", "control_seconds", "frame_seconds", "python_memory_peak_mb", "control_energy_proxy", *GPU_TELEMETRY_COLUMNS]
         csv_writer.writerow(base_columns + METRIC_COLUMNS)
 
         while True:
             success, frame = capture.read()
             if not success:
                 break
+            frame_start_time = time.perf_counter()
 
             new_guidance_data = guidance.get(frame_index)
             if new_guidance_data is not None:
@@ -539,6 +560,7 @@ def simulate_robot_mpc_flock_target_predictor(
 
             if data is not None:
                 if frame_index >= next_control_frame:
+                    control_start_time = time.perf_counter()
                     reference_points = build_reference_horizon(guidance, frame_index, data, horizon, control_interval_frames)
                     optimal_controls, predicted_states, mpc_cost, optimizer_success, optimizer_iterations = solve_mpc(
                         state=state,
@@ -574,6 +596,9 @@ def simulate_robot_mpc_flock_target_predictor(
                     last_optimizer_iterations = optimizer_iterations
                     mpc_updated = True
                     next_control_frame = frame_index + control_interval_frames
+                    control_seconds = time.perf_counter() - control_start_time
+                else:
+                    control_seconds = 0.0
 
                 state = update_state(state, current_control, dt_video)
                 state[0] = clamp(state[0], 0.0, width - 1.0)
@@ -619,8 +644,34 @@ def simulate_robot_mpc_flock_target_predictor(
                 flock_scale = None if current_guidance is None else max(float(current_guidance["flock_ellipse_major_axis"]), float(current_guidance["flock_ellipse_minor_axis"]))
                 selected_dog = select_closest_dog(dog_detections.get(frame_index, []), mpc_point)
                 metrics = build_spatial_metrics("flock_only_target_prediction", selected_dog, flock_center, mpc_point, flock_scale)
-                base_values = [frame_index, f"{frame_index / fps:.3f}", f"{state[0]:.3f}", f"{state[1]:.3f}", f"{theta_degrees:.3f}", f"{current_control[0]:.3f}", f"{omega_degrees:.3f}", f"{data['target_x']:.3f}", f"{data['target_y']:.3f}", f"{data['desired_x']:.3f}", f"{data['desired_y']:.3f}", f"{distance_to_desired:.3f}", data["status"], f"{float(data.get('rear_direction_x', 0.0)):.6f}", f"{float(data.get('rear_direction_y', 0.0)):.6f}", f"{float(data.get('rear_direction_confidence', 0.0)):.6f}", data.get("rear_direction_source", ""), f"{last_mpc_cost:.8f}", last_optimizer_success, last_optimizer_iterations]
+                _, peak_memory_bytes = tracemalloc.get_traced_memory()
+                gpu_metrics = gpu_monitor.snapshot()
+                # This is a unitless quadratic control-effort proxy, not electrical energy.
+                control_energy_proxy = (current_control[0] ** 2 + current_control[1] ** 2) * dt_video
+                inference_seconds = guidance_seconds.get(frame_index, 0.0)
+                performance_values = [f"{inference_seconds:.6f}", f"{control_seconds:.6f}", f"{inference_seconds + time.perf_counter() - frame_start_time:.6f}", f"{peak_memory_bytes / (1024.0 ** 2):.3f}", f"{control_energy_proxy:.6f}"] + [f"{gpu_metrics[column]:.6f}" for column in GPU_TELEMETRY_COLUMNS]
+                base_values = [frame_index, f"{frame_index / fps:.3f}", f"{state[0]:.3f}", f"{state[1]:.3f}", f"{theta_degrees:.3f}", f"{current_control[0]:.3f}", f"{omega_degrees:.3f}", f"{data['target_x']:.3f}", f"{data['target_y']:.3f}", f"{data['desired_x']:.3f}", f"{data['desired_y']:.3f}", f"{distance_to_desired:.3f}", data["status"], int(flock_detected.get(frame_index, False)), len(dog_detections.get(frame_index, [])), f"{float(data.get('rear_direction_x', 0.0)):.6f}", f"{float(data.get('rear_direction_y', 0.0)):.6f}", f"{float(data.get('rear_direction_confidence', 0.0)):.6f}", data.get("rear_direction_source", ""), f"{last_mpc_cost:.8f}", last_optimizer_success, last_optimizer_iterations] + performance_values
                 csv_writer.writerow(base_values + [metrics[column] for column in METRIC_COLUMNS])
+            else:
+                _, peak_memory_bytes = tracemalloc.get_traced_memory()
+                gpu_metrics = gpu_monitor.snapshot()
+                empty_values = {column: "" for column in base_columns}
+                empty_values.update(
+                    {
+                        "frame": frame_index,
+                        "time_seconds": f"{frame_index / fps:.3f}",
+                        "status": "NO_GUIDANCE",
+                        "flock_detected": int(flock_detected.get(frame_index, False)),
+                        "dog_detections": len(dog_detections.get(frame_index, [])),
+                        "inference_seconds": f"{guidance_seconds.get(frame_index, 0.0):.6f}",
+                        "control_seconds": "0.000000",
+                        "frame_seconds": f"{guidance_seconds.get(frame_index, 0.0) + time.perf_counter() - frame_start_time:.6f}",
+                        "python_memory_peak_mb": f"{peak_memory_bytes / (1024.0 ** 2):.3f}",
+                        "control_energy_proxy": "0.000000",
+                        **{column: f"{gpu_metrics[column]:.6f}" for column in GPU_TELEMETRY_COLUMNS},
+                    }
+                )
+                csv_writer.writerow([empty_values[column] for column in base_columns] + ["" for _ in METRIC_COLUMNS])
 
             video_writer.write(frame)
             frame_index += 1
@@ -630,12 +681,34 @@ def simulate_robot_mpc_flock_target_predictor(
 
     capture.release()
     video_writer.release()
+    gpu_monitor.stop()
+
+    performance_columns = ["inference_seconds", "control_seconds", "frame_seconds", "python_memory_peak_mb", "control_energy_proxy", *GPU_TELEMETRY_COLUMNS]
+    with output_csv.open("r", encoding="utf-8", newline="") as csv_file:
+        output_rows = list(csv.DictReader(csv_file))
+    if output_rows:
+        output_rows[-1].update({column: f"{value:.6f}" for column, value in gpu_monitor.snapshot().items()})
+    spatial_columns = [column for column in output_rows[0] if column not in performance_columns] if output_rows else []
+    with output_csv.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=spatial_columns)
+        writer.writeheader()
+        writer.writerows([{column: row[column] for column in spatial_columns} for row in output_rows])
+    with performance_csv.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=["frame", *performance_columns])
+        writer.writeheader()
+        writer.writerows(
+            [{"frame": row["frame"], **{column: row[column] for column in performance_columns}} for row in output_rows]
+        )
+
+    if started_tracing:
+        tracemalloc.stop()
     print()
     print("=" * 70)
     print("FLOCK-ONLY TARGET MPC FINISHED")
     print("=" * 70)
     print(f"Video: {output_video}")
     print(f"CSV: {output_csv}")
+    print(f"Performance CSV: {performance_csv}")
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -645,7 +718,8 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--predictor-checkpoint", type=Path, required=True)
     parser.add_argument("--confidence", type=float, default=0.15)
     parser.add_argument("--image-size", type=int, default=960)
-    parser.add_argument("--predictor-device", type=str, default="cpu")
+    parser.add_argument("--predictor-device", type=str, default="cuda:0")
+    parser.add_argument("--detector-device", type=str, default="0", help="CUDA device used by YOLO, for example 0 or cuda:0.")
     parser.add_argument("--single-flock", action="store_true", help="Selecciona siempre el rebaño de mayor área en cada frame.")
     parser.add_argument("--robot-start-x", type=float, required=True)
     parser.add_argument("--robot-start-y", type=float, required=True)
@@ -694,6 +768,7 @@ def main() -> None:
         confidence=args.confidence,
         image_size=args.image_size,
         predictor_device=args.predictor_device,
+        detector_device=args.detector_device,
         single_flock=args.single_flock,
         run_name=args.name,
     )
