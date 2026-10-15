@@ -38,3 +38,8 @@ Thumbs.db
 
 # Agente principal IA
 AGENTS.md
+
+# Clases innecesarias en repo
+/src/process_dji_metadata.py
+/src/split_srt_segments.py
+/src/visualize_dji_results.py
