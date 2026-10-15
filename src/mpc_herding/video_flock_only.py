@@ -182,8 +182,19 @@ def initial_robot_state(
     width: int,
     height: int,
     offset_scale: float,
+    robot_start: str | None = None,
 ) -> RobotState:
     center = box_center(first_flock_box)
+    if robot_start is not None:
+        x_text, y_text = robot_start.split(",", maxsplit=1)
+        position = np.array([float(x_text), float(y_text)], dtype=float)
+        if not (0 <= position[0] < width and 0 <= position[1] < height):
+            raise ValueError(
+                f"--robot-start must be inside the video frame (0 <= x < {width}, 0 <= y < {height})."
+            )
+        heading = math.atan2(center[1] - position[1], center[0] - position[0])
+        return RobotState(float(position[0]), float(position[1]), heading)
+
     rear = center - target
     rear_norm = np.linalg.norm(rear)
     if rear_norm < 1e-6:
@@ -499,7 +510,8 @@ def simulate_video_flock_only(
                     width=width,
                     height=height,
                     offset_scale=args.initial_robot_offset_scale,
-            )
+                    robot_start=args.robot_start,
+                )
 
             if args.guidance_mode == "cmff":
                 guidance = cmff.compute(positions, velocities, target)
@@ -820,6 +832,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stall-speed", type=float, default=1.0, help="Maximum linear speed considered stationary in px/s.")
     parser.add_argument("--stall-angular-speed", type=float, default=0.05, help="Maximum angular speed considered stationary in rad/s.")
     parser.add_argument("--initial-robot-offset-scale", type=float, default=1.4)
+    parser.add_argument(
+        "--robot-start",
+        type=str,
+        default=None,
+        help="Initial robot position as x,y in image pixels. Example: --robot-start 200,600",
+    )
     parser.add_argument("--trail-length", type=int, default=240)
     return parser
 
