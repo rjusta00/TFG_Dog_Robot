@@ -473,6 +473,7 @@ def simulate_robot_mpc_flock_target_predictor(
     predictor_device: str,
     detector_device: str,
     single_flock: bool,
+    output_dir: Path,
     run_name: str,
 ) -> None:
     started_tracing = not tracemalloc.is_tracing()
@@ -504,7 +505,7 @@ def simulate_robot_mpc_flock_target_predictor(
     max_omega = math.radians(max_omega_degrees)
     max_angular_acceleration = math.radians(max_angular_acceleration_degrees)
 
-    output_directory = OUTPUT_ROOT / run_name
+    output_directory = resolve_project_path(output_dir) / run_name
     output_directory.mkdir(parents=True, exist_ok=True)
     output_video = output_directory / f"{Path(video_path).stem}_flock_target_mpc.mp4"
     output_csv = output_directory / f"{Path(video_path).stem}_flock_target_mpc.csv"
@@ -738,6 +739,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--weight-terminal-velocity", type=float, default=5.0)
     parser.add_argument("--weight-smoothness", type=float, default=1.0)
     parser.add_argument("--smoothing-alpha", type=float, default=0.25)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_ROOT)
     parser.add_argument("--name", type=str, default="flock_target_predictor_mpc")
     return parser.parse_args()
 
@@ -770,6 +772,7 @@ def main() -> None:
         predictor_device=args.predictor_device,
         detector_device=args.detector_device,
         single_flock=args.single_flock,
+        output_dir=args.output_dir,
         run_name=args.name,
     )
 

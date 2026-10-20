@@ -139,6 +139,20 @@ models/flock_target_gru_flock_target_predictor.pt
 python src/flock_only_target_prediction/simulate_robot_mpc_flock_target_predictor.py --video "videos/rebano_01_1min.mp4" --detector-model "models/dogRobot_v2_best.pt" --predictor-checkpoint "models/flock_target_gru_flock_target_predictor.pt" --robot-start-x 1820 --robot-start-y 80 --initial-heading 0 --predictor-device cpu --name "flock_target_test"
 ```
 
+Use `--output-dir runs/benchmark/my_run` to store this pipeline's video and CSV files in a specific directory.
+
+### Reproducible video benchmark
+
+Run the automated benchmark from the repository root, using the Python environment that has the project dependencies installed:
+
+```bash
+python scripts/run_benchmark.py --video "videos/rebano_02.mp4"
+```
+
+It alternates the two pipelines, runs four warm-up trials and ten measurements per pipeline, and writes outputs under `runs/benchmark/<video>_benchmark_<timestamp>/`. The session directory includes per-run logs, `run_manifest.csv`, and `measurement_summary.csv`, whose rows aggregate only the ten measurement trials for each model. The `plots/` directory contains SVG comparison charts for execution time, throughput, latency, GPU energy, GPU memory, temperature, and optimizer success rate.
+
+For a video with a different initial robot position or target, pass `--robot-start X,Y --target X,Y`.
+
 ## Video Pipeline: MPC Herding From Flock Only
 
 The `src/mpc_herding` module contains the implementation inspired by the CMFF + MPC paper. For real videos, the recommended mode is `adaptive-sweep`, because the detector provides a flock-level ellipse rather than individual sheep positions.
