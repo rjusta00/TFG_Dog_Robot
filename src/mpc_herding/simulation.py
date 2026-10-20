@@ -6,8 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .cmff import CMFFGuidance
-from .config import CMFFConfig, DynamicsConfig, MPCConfig, SimulationConfig
+from .config import DynamicsConfig, MPCConfig, SimulationConfig
 from .dynamics import SelfOrganizationRule, step_herd
 from .mpc import MPCController, RobotState
 
@@ -32,10 +31,15 @@ def collective_dispersion(positions: np.ndarray) -> float:
     return float(np.mean(np.linalg.norm(positions - centroid[None, :], axis=1)))
 
 
+def rear_driving_point(positions: np.ndarray, target: np.ndarray, offset: float = 8.0) -> np.ndarray:
+    centroid = positions.mean(axis=0)
+    direction = centroid - target
+    return centroid + offset * direction / max(np.linalg.norm(direction), 1e-6)
+
+
 def run_simulation(
     simulation_config: SimulationConfig,
     dynamics_config: DynamicsConfig,
-    cmff_config: CMFFConfig,
     mpc_config: MPCConfig,
     rule: SelfOrganizationRule,
     obstacles: np.ndarray,
@@ -43,15 +47,17 @@ def run_simulation(
 ) -> dict[str, float]:
     rng = np.random.default_rng(simulation_config.random_seed + 1)
     positions, velocities, target, robot_state = initialize_herd(simulation_config)
-    cmff = CMFFGuidance(cmff_config)
-    controller = MPCController(mpc_config, dynamics_config, cmff, rule)
+    controller = MPCController(mpc_config, dynamics_config, rule)
     robot_distance = 0.0
     herd_distance = np.zeros(simulation_config.herd_size, dtype=float)
     rows = []
 
     for step in range(simulation_config.max_steps):
-        guidance = cmff.compute(positions, velocities, target)
-        control, optimizer_success, optimizer_cost = controller.solve(robot_state, positions, velocities, target, obstacles)
+        centroid = positions.mean(axis=0)
+        driving_point = rear_driving_point(positions, target)
+        control, optimizer_success, optimizer_cost = controller.solve(
+            robot_state, positions, velocities, target, obstacles, driving_point
+        )
         previous_robot_position = robot_state.position
         new_robot_array = controller.step_robot_state(robot_state.as_array(), control)
         robot_state = RobotState.from_array(new_robot_array)
@@ -79,16 +85,12 @@ def run_simulation(
                 "robot_theta": robot_state.theta,
                 "control_v": control[0],
                 "control_omega": control[1],
-                "centroid_x": guidance.centroid[0],
-                "centroid_y": guidance.centroid[1],
+                "centroid_x": centroid[0],
+                "centroid_y": centroid[1],
                 "target_x": target[0],
                 "target_y": target[1],
-                "driving_point_x": guidance.driving_point[0],
-                "driving_point_y": guidance.driving_point[1],
-                "q_div_x": guidance.q_div[0],
-                "q_div_y": guidance.q_div[1],
-                "max_divergence": guidance.max_divergence,
-                "escape_detected": int(guidance.escape_detected),
+                "driving_point_x": driving_point[0],
+                "driving_point_y": driving_point[1],
                 "coverage_rate": current_coverage,
                 "collective_dispersion": collective_dispersion(positions),
                 "optimizer_success": int(optimizer_success),
@@ -125,15 +127,12 @@ def parse_obstacles(values: list[str]) -> np.ndarray:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the CMFF + MPC herding simulation.")
+    parser = argparse.ArgumentParser(description="Run the MPC herding simulation.")
     parser.add_argument("--herd-size", type=int, default=50)
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--rule", choices=[rule.value for rule in SelfOrganizationRule], default=SelfOrganizationRule.BOIDS.value)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--horizon", type=int, default=10)
-    parser.add_argument("--eta", type=float, default=0.5)
-    parser.add_argument("--sigma", type=float, default=3.0)
-    parser.add_argument("--tau", type=float, default=0.5)
     parser.add_argument("--target-radius", type=float, default=5.0)
     parser.add_argument("--obstacle", action="append", default=[], help="Obstacle as x,y. Can be repeated.")
     parser.add_argument("--output-csv", type=Path, default=None)
@@ -149,12 +148,10 @@ def main() -> None:
         random_seed=args.seed,
     )
     dynamics_config = DynamicsConfig(w_obstacle=0.1 if args.obstacle else 0.0)
-    cmff_config = CMFFConfig(eta=args.eta, sigma=args.sigma, divergence_threshold=args.tau)
     mpc_config = MPCConfig(horizon=args.horizon, w_obstacle=0.05 if args.obstacle else 0.0)
     metrics = run_simulation(
         simulation_config=simulation_config,
         dynamics_config=dynamics_config,
-        cmff_config=cmff_config,
         mpc_config=mpc_config,
         rule=SelfOrganizationRule(args.rule),
         obstacles=parse_obstacles(args.obstacle),

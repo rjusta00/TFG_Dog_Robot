@@ -188,6 +188,7 @@ def build_guidance_from_flock_predictor(
     predictor_device: str,
     detector_device: str,
     single_flock: bool,
+    max_frames: int | None,
 ) -> tuple[dict[int, dict], dict[int, list[dict]], dict[int, dict[int, list[tuple[int, int]]]], dict[int, float], dict[int, bool], float, int, int, int]:
     video_path = resolve_project_path(video_path)
     detector_model_path = resolve_project_path(detector_model_path)
@@ -247,6 +248,8 @@ def build_guidance_from_flock_predictor(
     frame_index = 0
 
     while True:
+        if max_frames is not None and frame_index >= max_frames:
+            break
         success, frame = capture.read()
         if not success:
             break
@@ -473,6 +476,7 @@ def simulate_robot_mpc_flock_target_predictor(
     predictor_device: str,
     detector_device: str,
     single_flock: bool,
+    max_frames: int | None,
     output_dir: Path,
     run_name: str,
 ) -> None:
@@ -491,6 +495,7 @@ def simulate_robot_mpc_flock_target_predictor(
         predictor_device,
         detector_device,
         single_flock,
+        max_frames,
     )
 
     capture = cv2.VideoCapture(str(resolve_project_path(video_path)))
@@ -547,6 +552,8 @@ def simulate_robot_mpc_flock_target_predictor(
         csv_writer.writerow(base_columns + METRIC_COLUMNS)
 
         while True:
+            if max_frames is not None and frame_index >= max_frames:
+                break
             success, frame = capture.read()
             if not success:
                 break
@@ -722,6 +729,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--predictor-device", type=str, default="cuda:0")
     parser.add_argument("--detector-device", type=str, default="0", help="CUDA device used by YOLO, for example 0 or cuda:0.")
     parser.add_argument("--single-flock", action="store_true", help="Selecciona siempre el rebaño de mayor área en cada frame.")
+    parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--robot-start-x", type=float, required=True)
     parser.add_argument("--robot-start-y", type=float, required=True)
     parser.add_argument("--initial-heading", type=float, default=0.0)
@@ -772,6 +780,7 @@ def main() -> None:
         predictor_device=args.predictor_device,
         detector_device=args.detector_device,
         single_flock=args.single_flock,
+        max_frames=args.max_frames,
         output_dir=args.output_dir,
         run_name=args.name,
     )

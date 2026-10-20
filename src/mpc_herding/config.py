@@ -25,19 +25,6 @@ class DynamicsConfig:
 
 
 @dataclass(frozen=True)
-class CMFFConfig:
-    """Parameters for CMFF construction and driving-point generation."""
-
-    sigma: float = 3.0
-    divergence_threshold: float = 0.5
-    eta: float = 0.5
-    driving_offset: float = 8.0
-    grid_padding: float = 8.0
-    grid_resolution: int = 35
-    epsilon: float = 1e-6
-
-
-@dataclass(frozen=True)
 class MPCConfig:
     """Nonlinear MPC parameters for Eq. (16)-(18)."""
 

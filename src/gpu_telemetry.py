@@ -14,16 +14,18 @@ GPU_TELEMETRY_COLUMNS = (
 )
 
 
-def gpu_index(device: str | int) -> int:
-    """Return the NVIDIA device index from values such as ``0`` or ``cuda:0``."""
+def gpu_index(device: str | int) -> int | None:
+    """Return the NVIDIA index, or ``None`` when inference runs on the CPU."""
     text = str(device)
+    if text.lower() == "cpu":
+        return None
     return int(text.rsplit(":", maxsplit=1)[-1]) if ":" in text else int(text)
 
 
 class GpuTelemetryMonitor:
     """Sample NVIDIA GPU telemetry outside the control loop."""
 
-    def __init__(self, device_index: int = 0, interval_seconds: float = 0.2) -> None:
+    def __init__(self, device_index: int | None = 0, interval_seconds: float = 0.2) -> None:
         self.device_index = device_index
         self.interval_seconds = interval_seconds
         self._latest = {column: 0.0 for column in GPU_TELEMETRY_COLUMNS}
@@ -73,6 +75,8 @@ class GpuTelemetryMonitor:
         return True
 
     def start(self) -> None:
+        if self.device_index is None:
+            return
         self.available = self._poll()
         if not self.available:
             return

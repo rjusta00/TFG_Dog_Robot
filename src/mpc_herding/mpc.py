@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .cmff import CMFFGuidance
 from .config import DynamicsConfig, MPCConfig
 from .dynamics import SelfOrganizationRule, step_herd
 
@@ -41,12 +40,10 @@ class MPCController:
         self,
         mpc_config: MPCConfig,
         dynamics_config: DynamicsConfig,
-        cmff: CMFFGuidance,
         rule: SelfOrganizationRule,
     ):
         self.mpc_config = mpc_config
         self.dynamics_config = dynamics_config
-        self.cmff = cmff
         self.rule = rule
         self.previous_solution: np.ndarray | None = None
 
@@ -91,7 +88,7 @@ class MPCController:
         herd_velocities: np.ndarray,
         target: np.ndarray,
         obstacles: np.ndarray,
-        driving_point_override: np.ndarray | None = None,
+        driving_point: np.ndarray,
     ) -> float:
         controls = flat_controls.reshape(-1, 2)
         robot = robot_state.as_array()
@@ -113,16 +110,10 @@ class MPCController:
                 config=self.dynamics_config,
                 dt=self.mpc_config.dt,
             )
-            cmff_result = self.cmff.compute(positions, velocities, target)
             visible_obstacles = self.visible_obstacles(robot[:2], obstacles)
-            driving_point = (
-                cmff_result.driving_point
-                if driving_point_override is None
-                else driving_point_override
-            )
 
             total_driving += float(np.sum((robot[:2] - driving_point) ** 2))
-            total_centroid += float(np.sum((cmff_result.centroid - target) ** 2))
+            total_centroid += float(np.sum((positions.mean(axis=0) - target) ** 2))
             total_energy += float(np.sum(control * control))
             if visible_obstacles.size:
                 distances = np.linalg.norm(visible_obstacles - robot[:2], axis=1)
@@ -197,17 +188,16 @@ class MPCController:
         herd_velocities: np.ndarray,
         target: np.ndarray,
         obstacles: np.ndarray,
-        driving_point_override: np.ndarray | None = None,
+        driving_point: np.ndarray,
     ) -> tuple[np.ndarray, bool, float]:
-        cmff_result = self.cmff.compute(herd_positions, herd_velocities, target)
         if minimize is None:
-            return self.fallback_control(robot_state, cmff_result.driving_point), False, float("nan")
+            return self.fallback_control(robot_state, driving_point), False, float("nan")
 
         previous_control = np.array([robot_state.v, robot_state.omega], dtype=float)
         result = minimize(
             fun=self.cost,
             x0=self.initial_guess(robot_state),
-            args=(robot_state, herd_positions, herd_velocities, target, obstacles, driving_point_override),
+            args=(robot_state, herd_positions, herd_velocities, target, obstacles, driving_point),
             method="SLSQP",
             bounds=self.bounds(),
             constraints=self.rate_constraints(previous_control),
@@ -218,6 +208,5 @@ class MPCController:
             self.previous_solution = result.x.copy()
             return result.x.reshape(-1, 2)[0], True, float(result.fun)
 
-        fallback_point = cmff_result.driving_point if driving_point_override is None else driving_point_override
-        control = self.fallback_control(robot_state, fallback_point)
+        control = self.fallback_control(robot_state, driving_point)
         return control, False, float(result.fun) if np.isfinite(result.fun) else float("nan")

@@ -209,7 +209,6 @@ def build_commands(args: argparse.Namespace, session_dir: Path, run_name: str, m
             "--robot-start", format_coordinate(args.robot_start),
             "--max-iterations", "10",
             "--synthetic-animals", "25",
-            "--grid-resolution", "15",
             "--target", format_coordinate(args.target),
         ]
         return command, output_dir / f"{run_name}.csv", output_dir / f"{run_name}_performance.csv"
@@ -439,7 +438,7 @@ def write_metadata(session_dir: Path, args: argparse.Namespace) -> None:
                 "horizon": 3,
                 "robot_start": args.robot_start,
             },
-            "mpc_herding": {"max_iterations": 10, "synthetic_animals": 25, "grid_resolution": 15, "target": args.target},
+            "mpc_herding": {"max_iterations": 10, "synthetic_animals": 25, "target": args.target},
             "flock_only_target_prediction": {"predictor_checkpoint": args.predictor_checkpoint},
         },
     }

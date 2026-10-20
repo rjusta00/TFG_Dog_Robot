@@ -4,9 +4,6 @@ Standalone implementation of the main algorithmic components from the provided P
 
 - Collective animal dynamics from Eq. (2)-(4).
 - Self-organization rules: `ran`, `nn`, `ha`, `lch`, `nla`, `vicsek`, `boids`.
-- Collective Motion Flow Field (CMFF) using Gaussian kernel smoothing, Eq. (6)-(8).
-- Escape-region selection and maximum-divergence point, Eq. (9)-(10).
-- Dynamic driving point with escape/herd direction fusion, Eq. (11)-(13).
 - Nonlinear MPC with SLSQP, control bounds, rate constraints, Ackermann-derived angular-rate limit, and the cost terms from Eq. (16)-(18).
 
 Run a smoke simulation from the repository root:
@@ -36,14 +33,11 @@ The video overlay is in English. It draws the flock ellipse, flock center, targe
 - `adaptive-sweep`: places the driving point behind the flock relative to the target and shifts it laterally according to the observed lateral drift of the flock center.
 - `sweep`: places the driving point behind the flock and adds a periodic side-to-side sweep.
 - `rear`: places the driving point behind the flock with no lateral sweep.
-- `cmff`: uses the CMFF maximum-divergence point. This is closest to the PDF formulation, but it is unstable when the video only provides one global flock detection instead of individual animal positions.
-
-For video use, `adaptive-sweep` is more stable than pure CMFF because the current detector provides a flock-level ellipse, not individual sheep positions and velocities.
 
 ### Recommended Command
 
 ```powershell
-python -m src.mpc_herding.video_flock_only --video path/to/video.mp4 --model models/dogRobot_v2_best.pt --draw-detected-dog --guidance-mode adaptive-sweep --horizon 3 --synthetic-animals 80 --grid-resolution 21 --image-size 640 --driving-offset 70 --sweep-amplitude 100 --lateral-drift-gain 1.2 --robot-max-speed 180 --guidance-smoothing 0.9 --guidance-max-step 35
+python -m src.mpc_herding.video_flock_only --video path/to/video.mp4 --model models/dogRobot_v2_best.pt --draw-detected-dog --guidance-mode adaptive-sweep --horizon 3 --synthetic-animals 80 --image-size 640 --driving-offset 70 --sweep-amplitude 100 --lateral-drift-gain 1.2 --robot-max-speed 180 --guidance-smoothing 0.9 --guidance-max-step 35
 ```
 
 Use `--target x,y` if the default target location is not appropriate for the video:
@@ -80,34 +74,18 @@ python -m src.mpc_herding.video_flock_only --video path/to/video.mp4 --guidance-
 Use this to check that the pipeline works before processing the full video:
 
 ```powershell
-python -m src.mpc_herding.video_flock_only --video path/to/video.mp4 --model models/dogRobot_v2_best.pt --max-frames 20 --horizon 1 --synthetic-animals 25 --grid-resolution 15 --image-size 416 --progress-interval 1 --debug-timing
-```
-
-### CMFF-Style Experimental Mode
-
-```powershell
-python -m src.mpc_herding.video_flock_only `
-  --video path/to/video.mp4 `
-  --model models/dogRobot_v2_best.pt `
-  --guidance-mode cmff `
-  --synthetic-animals 100 `
-  --sigma 45 `
-  --tau 0.0001 `
-  --eta 0.5 `
-  --horizon 8 `
-  --output-dir runs/mpc_herding
+python -m src.mpc_herding.video_flock_only --video path/to/video.mp4 --model models/dogRobot_v2_best.pt --max-frames 20 --horizon 1 --synthetic-animals 25 --image-size 416 --progress-interval 1 --debug-timing
 ```
 
 Outputs:
 
 - Annotated MP4 with flock ellipse, flock center, target, driving point, the next detected positions of each real dog (yellow), detected real dog boxes if requested, and simulated dog trajectory.
-- CSV with per-frame robot state, target, flock center, driving point, optional CMFF fields, and optimizer status.
+- CSV with per-frame robot state, target, flock center, driving point, and optimizer status.
 - The CSV also includes dog, flock, and MPC driving-point distances in pixels and normalized flock units. These metrics do not add any overlay to the output video.
 - By default, outputs are written to `runs/mpc_herding/`.
 
 ### Current Limitations
 
 - The video mode does not make the real flock respond to the simulated dog; it overlays a simulated dog trajectory on prerecorded flock motion.
-- `adaptive-sweep`, `sweep`, and `rear` are stable video heuristics, not the exact CMFF driving-point equation from the PDF.
-- Exact CMFF requires individual animal positions and velocities. With only a flock-level detection, CMFF must be approximated and can be noisy.
+- `adaptive-sweep`, `sweep`, and `rear` are geometric driving-point heuristics.
 - Coordinates are in image pixels, not calibrated meters, unless an external camera-to-ground calibration is added.

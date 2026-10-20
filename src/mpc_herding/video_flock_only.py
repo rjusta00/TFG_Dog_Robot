@@ -20,8 +20,7 @@ try:
 except ImportError:  # pragma: no cover
     YOLO = None
 
-from .cmff import CMFFGuidance
-from .config import CMFFConfig, DynamicsConfig, MPCConfig
+from .config import DynamicsConfig, MPCConfig
 from .dynamics import SelfOrganizationRule
 from .mpc import MPCController, RobotState
 from ..gpu_telemetry import GPU_TELEMETRY_COLUMNS, GpuTelemetryMonitor, gpu_index
@@ -339,7 +338,7 @@ def simulate_video_flock_only(
         raise RuntimeError(f"Cannot create output video: {output_video_path}")
 
     print("=" * 70, flush=True)
-    print("CMFF/MPC video mode using flock detections only", flush=True)
+    print("MPC video mode using flock detections only", flush=True)
     print("=" * 70, flush=True)
     print(f"Video: {video_path}", flush=True)
     print(f"Model: {model_path}", flush=True)
@@ -368,14 +367,6 @@ def simulate_video_flock_only(
         w_obstacle=0.0,
         w_robot=args.w_robot,
     )
-    cmff_config = CMFFConfig(
-        sigma=args.sigma,
-        divergence_threshold=args.tau,
-        eta=args.eta,
-        driving_offset=args.driving_offset,
-        grid_padding=args.grid_padding,
-        grid_resolution=args.grid_resolution,
-    )
     mpc_config = MPCConfig(
         horizon=args.horizon,
         dt=control_dt,
@@ -392,8 +383,7 @@ def simulate_video_flock_only(
         w_obstacle=0.0,
         max_iterations=args.max_iterations,
     )
-    cmff = CMFFGuidance(cmff_config)
-    controller = MPCController(mpc_config, dynamics_config, cmff, SelfOrganizationRule(args.rule))
+    controller = MPCController(mpc_config, dynamics_config, SelfOrganizationRule(args.rule))
 
     active_flock_track_id = None
     robot_state: RobotState | None = None
@@ -423,7 +413,7 @@ def simulate_video_flock_only(
             herd_velocities=velocities,
             target=target,
             obstacles=np.empty((0, 2), dtype=float),
-            driving_point_override=driving_point,
+            driving_point=driving_point,
         )
         stalled = (
             np.linalg.norm(driving_point - robot.position) > args.stall_distance
@@ -484,9 +474,7 @@ def simulate_video_flock_only(
         optimizer_cost = last_optimizer_cost
         control_recovery = last_control_recovery
         control_seconds = 0.0
-        guidance = None
         raw_driving_point = None
-        rear_direction = None
 
         if selected_flock is not None:
             control_start_time = time.perf_counter()
@@ -513,22 +501,18 @@ def simulate_video_flock_only(
                     robot_start=args.robot_start,
                 )
 
-            if args.guidance_mode == "cmff":
-                guidance = cmff.compute(positions, velocities, target)
-                raw_driving_point = guidance.driving_point
-            else:
-                raw_driving_point, rear_direction = geometric_driving_point(
-                    center=previous_center,
-                    axes=previous_axes,
-                    target=target,
-                    frame_index=frame_index,
-                    mode=args.guidance_mode,
-                    driving_offset=args.driving_offset,
-                    sweep_amplitude=args.sweep_amplitude,
-                    sweep_period=args.sweep_period,
-                    center_velocity=np.mean(velocities, axis=0) * dt,
-                    lateral_drift_gain=args.lateral_drift_gain,
-                )
+            raw_driving_point, _ = geometric_driving_point(
+                center=previous_center,
+                axes=previous_axes,
+                target=target,
+                frame_index=frame_index,
+                mode=args.guidance_mode,
+                driving_offset=args.driving_offset,
+                sweep_amplitude=args.sweep_amplitude,
+                sweep_period=args.sweep_period,
+                center_velocity=np.mean(velocities, axis=0) * dt,
+                lateral_drift_gain=args.lateral_drift_gain,
+            )
             smoothed_driving_point = smooth_point(
                 previous=smoothed_driving_point,
                 current=raw_driving_point,
@@ -566,11 +550,8 @@ def simulate_video_flock_only(
             control_start_time = time.perf_counter()
             if args.debug_timing:
                 print(f"  frame {frame_index}: starting guidance+MPC from last flock", flush=True)
-            if args.guidance_mode == "cmff":
-                guidance = cmff.compute(last_positions, last_velocities, target)
-                raw_driving_point = guidance.driving_point
-            elif previous_center is not None and previous_axes is not None:
-                raw_driving_point, rear_direction = geometric_driving_point(
+            if previous_center is not None and previous_axes is not None:
+                raw_driving_point, _ = geometric_driving_point(
                     center=previous_center,
                     axes=previous_axes,
                     target=target,
@@ -639,18 +620,6 @@ def simulate_video_flock_only(
             )
             draw_label(annotated, "Flock center", (center_point[0] + 10, center_point[1] - 10), (0, 255, 255))
 
-        if guidance is not None and args.guidance_mode == "cmff":
-            cv2.circle(annotated, tuple(np.round(guidance.q_div).astype(int)), 7, (0, 0, 255), -1)
-            cv2.circle(annotated, tuple(np.round(raw_driving_point).astype(int)), 4, (180, 0, 180), 1)
-            cv2.arrowedLine(
-                annotated,
-                tuple(np.round(guidance.q_div).astype(int)),
-                tuple(np.round(guidance.q_div + 35.0 * guidance.fused_direction).astype(int)),
-                (255, 0, 255),
-                2,
-                tipLength=0.3,
-            )
-
         if smoothed_driving_point is not None:
             cv2.circle(annotated, tuple(np.round(smoothed_driving_point).astype(int)), 8, (255, 0, 255), -1)
             if previous_center is not None:
@@ -713,10 +682,6 @@ def simulate_video_flock_only(
                 "driving_point_y": "" if raw_driving_point is None else f"{raw_driving_point[1]:.3f}",
                 "smoothed_driving_point_x": "" if smoothed_driving_point is None else f"{smoothed_driving_point[0]:.3f}",
                 "smoothed_driving_point_y": "" if smoothed_driving_point is None else f"{smoothed_driving_point[1]:.3f}",
-                "q_div_x": "" if guidance is None else f"{guidance.q_div[0]:.3f}",
-                "q_div_y": "" if guidance is None else f"{guidance.q_div[1]:.3f}",
-                "max_divergence": "" if guidance is None else f"{guidance.max_divergence:.6f}",
-                "escape_detected": "" if guidance is None else int(guidance.escape_detected),
                 "optimizer_success": int(optimizer_success),
                 "optimizer_cost": "" if math.isnan(optimizer_cost) else f"{optimizer_cost:.6f}",
                 "inference_seconds": f"{detection_seconds:.6f}",
@@ -800,18 +765,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-y", type=float, default=None)
     parser.add_argument("--target-margin", type=float, default=80.0)
     parser.add_argument("--target-radius", type=float, default=45.0)
-    parser.add_argument("--sigma", type=float, default=45.0)
-    parser.add_argument("--tau", type=float, default=0.0001)
-    parser.add_argument("--eta", type=float, default=0.5)
-    parser.add_argument("--guidance-mode", choices=["adaptive-sweep", "sweep", "rear", "cmff"], default="adaptive-sweep")
+    parser.add_argument("--guidance-mode", choices=["adaptive-sweep", "sweep", "rear"], default="adaptive-sweep")
     parser.add_argument("--driving-offset", type=float, default=70.0)
     parser.add_argument("--sweep-amplitude", type=float, default=120.0)
     parser.add_argument("--sweep-period", type=float, default=90.0)
     parser.add_argument("--lateral-drift-gain", type=float, default=1.2)
     parser.add_argument("--guidance-smoothing", type=float, default=0.90, help="0 disables smoothing; values near 1 stabilize the pink point more.")
     parser.add_argument("--guidance-max-step", type=float, default=35.0, help="Maximum pink-point displacement per frame in pixels. 0 disables the limit.")
-    parser.add_argument("--grid-padding", type=float, default=80.0)
-    parser.add_argument("--grid-resolution", type=int, default=31)
     parser.add_argument("--horizon", type=int, default=8)
     parser.add_argument("--robot-max-speed", type=float, default=260.0)
     parser.add_argument("--robot-max-omega", type=float, default=4.0)
@@ -845,7 +805,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     video_path = resolve_project_path(args.video)
-    run_name = args.run_name or f"{video_path.stem}_cmff_mpc_flock_only"
+    run_name = args.run_name or f"{video_path.stem}_mpc_flock_only"
     output_dir = resolve_project_path(args.output_dir)
     simulate_video_flock_only(
         video_path=video_path,
