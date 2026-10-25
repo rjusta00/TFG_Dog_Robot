@@ -61,6 +61,18 @@ SUMMARY_METRICS = (
     "optimizer_success_rate",
 )
 
+PER_FRAME_METRICS = (
+    "inference_seconds",
+    "control_seconds",
+    "frame_seconds",
+    "python_memory_peak_mb",
+    "gpu_power_w",
+    "gpu_memory_used_mb",
+    "gpu_utilization_pct",
+    "gpu_temperature_c",
+    "gpu_energy_j",
+)
+
 MODEL_LABELS = {
     "mpc_herding": "MPC herding",
     "flock_only_target_prediction": "Flock-only predictor",
@@ -96,6 +108,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--session-name", default=None)
     parser.add_argument("--warmups", type=int, default=4)
     parser.add_argument("--measurements", type=int, default=10)
+    parser.add_argument(
+        "--summary-by-frame",
+        action="store_true",
+        help="Aggregate the measurement runs by frame instead of producing one summary row per model.",
+    )
     return parser.parse_args()
 
 
@@ -319,6 +336,46 @@ def write_measurement_summary(session_dir: Path, run_rows: list[dict[str, Any]])
     write_csv(session_dir / "measurement_summary.csv", summary_rows, fields)
 
 
+def write_per_frame_summary(session_dir: Path, run_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int], dict[str, list[float]]] = {}
+    successful = [
+        row
+        for row in run_rows
+        if row["phase"] == "measurement" and row["return_code"] == 0 and not row["summary_error"]
+    ]
+    for run in successful:
+        performance_path = PROJECT_ROOT / run["performance_csv_path"]
+        with performance_path.open("r", newline="", encoding="utf-8") as csv_file:
+            for performance_row in csv.DictReader(csv_file):
+                frame = int(performance_row["frame"])
+                values = grouped.setdefault((run["model"], frame), {metric: [] for metric in PER_FRAME_METRICS})
+                for metric in PER_FRAME_METRICS:
+                    value = as_float(performance_row.get(metric))
+                    if value is not None:
+                        values[metric].append(value)
+
+    fields = ["model", "frame", "runs"]
+    for metric in PER_FRAME_METRICS:
+        fields.extend((f"{metric}_mean", f"{metric}_median", f"{metric}_std", f"{metric}_min", f"{metric}_max"))
+    summary_rows = []
+    for (model, frame), values_by_metric in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1])):
+        row: dict[str, Any] = {
+            "model": model,
+            "frame": frame,
+            "runs": len(values_by_metric["frame_seconds"]),
+        }
+        for metric, values in values_by_metric.items():
+            if values:
+                row[f"{metric}_mean"] = statistics.mean(values)
+                row[f"{metric}_median"] = statistics.median(values)
+                row[f"{metric}_std"] = statistics.stdev(values) if len(values) > 1 else 0.0
+                row[f"{metric}_min"] = min(values)
+                row[f"{metric}_max"] = max(values)
+        summary_rows.append(row)
+    write_csv(session_dir / "per_frame_measurement_summary.csv", summary_rows, fields)
+    return summary_rows
+
+
 def format_value(value: float) -> str:
     if abs(value) >= 100:
         return f"{value:.1f}"
@@ -421,6 +478,94 @@ def write_measurement_plots(session_dir: Path, run_rows: list[dict[str, Any]]) -
     return created_paths
 
 
+def write_per_frame_line_chart(path: Path, title: str, unit: str, metric: str, summary_rows: list[dict[str, Any]]) -> None:
+    width, height = 1200, 640
+    left, right, top, bottom = 115, 55, 90, 110
+    chart_width = width - left - right
+    chart_height = height - top - bottom
+    by_model = {
+        model: [row for row in summary_rows if row["model"] == model]
+        for model in MODEL_LABELS
+    }
+    maximum_frame = max(int(row["frame"]) for rows in by_model.values() for row in rows)
+    value_columns = (f"{metric}_mean", f"{metric}_median")
+    maximum_value = max(
+        float(row[column])
+        for rows in by_model.values()
+        for row in rows
+        for column in value_columns
+        if row.get(column) not in (None, "")
+    )
+    axis_maximum = maximum_value * 1.15 if maximum_value > 0 else 1.0
+
+    def x_position(frame: int) -> float:
+        return left + chart_width * frame / max(1, maximum_frame)
+
+    def y_position(value: float) -> float:
+        return top + chart_height * (1.0 - value / axis_maximum)
+
+    colors = {"mpc_herding": "#0f766e", "flock_only_target_prediction": "#c2410c"}
+    elements = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        '<style>text { font-family: Arial, sans-serif; fill: #1f2937; } .axis { stroke: #6b7280; stroke-width: 1; } .grid { stroke: #d1d5db; stroke-width: 1; } .tick { font-size: 15px; } .label { font-size: 18px; font-weight: 600; } .title { font-size: 27px; font-weight: 700; }</style>',
+        f'<text x="{width / 2}" y="42" text-anchor="middle" class="title">{html.escape(title)}</text>',
+        '<text x="600" y="68" text-anchor="middle" class="tick">Solid: mean. Dashed: median. Lines are aggregated over measurement runs.</text>',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + chart_height}" class="axis"/>',
+        f'<line x1="{left}" y1="{top + chart_height}" x2="{left + chart_width}" y2="{top + chart_height}" class="axis"/>',
+    ]
+    for tick in range(6):
+        value = axis_maximum * tick / 5
+        y = y_position(value)
+        elements.append(f'<line x1="{left}" y1="{y:.2f}" x2="{left + chart_width}" y2="{y:.2f}" class="grid"/>')
+        elements.append(f'<text x="{left - 12}" y="{y + 6:.2f}" text-anchor="end" class="tick">{format_value(value)}</text>')
+        frame = round(maximum_frame * tick / 5)
+        x = x_position(frame)
+        elements.append(f'<text x="{x:.2f}" y="{top + chart_height + 30}" text-anchor="middle" class="tick">{frame}</text>')
+    elements.append(f'<text x="{width / 2}" y="{height - 25}" text-anchor="middle" class="label">frame</text>')
+    elements.append(f'<text x="28" y="{top + chart_height / 2}" transform="rotate(-90 28 {top + chart_height / 2})" text-anchor="middle" class="label">{html.escape(unit)}</text>')
+
+    for index, (model, rows) in enumerate(by_model.items()):
+        for column, dash in ((f"{metric}_mean", ""), (f"{metric}_median", ' stroke-dasharray="9 6"')):
+            points = " ".join(
+                f"{x_position(int(row['frame'])):.2f},{y_position(float(row[column])):.2f}"
+                for row in rows
+                if row.get(column) not in (None, "")
+            )
+            if points:
+                elements.append(f'<polyline points="{points}" fill="none" stroke="{colors[model]}" stroke-width="2.5"{dash}/>')
+        legend_y = 98 + index * 26
+        elements.append(f'<line x1="{width - 290}" y1="{legend_y}" x2="{width - 255}" y2="{legend_y}" stroke="{colors[model]}" stroke-width="3"/>')
+        elements.append(f'<text x="{width - 245}" y="{legend_y + 6}" class="tick">{MODEL_LABELS[model]}</text>')
+    elements.append(f'<line x1="{width - 290}" y1="{legend_y + 30}" x2="{width - 255}" y2="{legend_y + 30}" stroke="#111827" stroke-width="3" stroke-dasharray="9 6"/>')
+    elements.append(f'<text x="{width - 245}" y="{legend_y + 36}" class="tick">median</text>')
+    elements.append("</svg>")
+    path.write_text("\n".join(elements), encoding="utf-8")
+
+
+def write_per_frame_plots(session_dir: Path, summary_rows: list[dict[str, Any]]) -> list[Path]:
+    plots_dir = session_dir / "plots"
+    plots_dir.mkdir(exist_ok=True)
+    plot_definitions = (
+        ("01_per_frame_inference.svg", "Inference time by frame", "seconds", "inference_seconds"),
+        ("02_per_frame_control.svg", "Control time by frame", "seconds", "control_seconds"),
+        ("03_per_frame_total.svg", "Total frame time by frame", "seconds", "frame_seconds"),
+        ("04_per_frame_gpu_power.svg", "GPU power by frame", "watts", "gpu_power_w"),
+        ("05_per_frame_gpu_memory.svg", "GPU memory by frame", "MB", "gpu_memory_used_mb"),
+        ("06_per_frame_gpu_utilization.svg", "GPU utilization by frame", "percent", "gpu_utilization_pct"),
+        ("07_per_frame_gpu_temperature.svg", "GPU temperature by frame", "degrees C", "gpu_temperature_c"),
+        ("08_per_frame_gpu_energy.svg", "Cumulative GPU energy by frame", "joules", "gpu_energy_j"),
+    )
+    paths = []
+    for filename, title, unit, metric in plot_definitions:
+        if all(any(row["model"] == model and row.get(f"{metric}_mean") not in (None, "") for row in summary_rows) for model in MODEL_LABELS):
+            path = plots_dir / filename
+            write_per_frame_line_chart(path, title, unit, metric, summary_rows)
+            paths.append(path)
+    return paths
+
+
 def write_metadata(session_dir: Path, args: argparse.Namespace) -> None:
     metadata = {
         "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -428,6 +573,7 @@ def write_metadata(session_dir: Path, args: argparse.Namespace) -> None:
         "python_executable": sys.executable,
         "warmups_per_model": args.warmups,
         "measurements_per_model": args.measurements,
+        "summary_by_frame": args.summary_by_frame,
         "commands": {
             "shared": {
                 "video": args.video,
@@ -479,8 +625,12 @@ def main() -> int:
                 outcome = "OK" if row["return_code"] == 0 else f"FAILED ({row['return_code']})"
                 print(f"  {outcome} in {row['wall_time_seconds']:.2f} s", flush=True)
 
-    write_measurement_summary(session_dir, run_rows)
-    plot_paths = write_measurement_plots(session_dir, run_rows)
+    if args.summary_by_frame:
+        per_frame_rows = write_per_frame_summary(session_dir, run_rows)
+        plot_paths = write_per_frame_plots(session_dir, per_frame_rows)
+    else:
+        write_measurement_summary(session_dir, run_rows)
+        plot_paths = write_measurement_plots(session_dir, run_rows)
     failed_runs = [row for row in run_rows if row["return_code"] != 0 or row["summary_error"]]
     print(f"Results: {session_dir}", flush=True)
     if plot_paths:

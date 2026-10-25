@@ -152,6 +152,8 @@ It alternates the two pipelines, runs four warm-up trials and ten measurements p
 
 For a video with a different initial robot position or target, pass `--robot-start X,Y --target X,Y`.
 
+Use `--summary-by-frame` to write `per_frame_measurement_summary.csv` and time-series SVG comparisons. Each row groups the successful measurement executions of one model at one video frame and reports its mean, median, standard deviation, minimum, and maximum.
+
 ## Video Pipeline: MPC Herding From Flock Only
 
 The `src/mpc_herding` module provides flock-only MPC herding. For real videos, the recommended mode is `adaptive-sweep`, because the detector provides a flock-level ellipse rather than individual sheep positions.
