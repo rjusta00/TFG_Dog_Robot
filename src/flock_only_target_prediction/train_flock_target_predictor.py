@@ -3,6 +3,7 @@ import csv
 import json
 import math
 import random
+import shutil
 import sys
 from collections import deque
 from pathlib import Path
@@ -83,6 +84,23 @@ DATASET_FIELDNAMES = [
     "lateral_distance",
     "selection_score",
 ]
+
+FEATURE_NAMES = [
+    "flock_center_x_normalized",
+    "flock_center_y_normalized",
+    "flock_major_axis_normalized",
+    "flock_minor_axis_normalized",
+    "flock_aspect_ratio",
+    "flock_area_ratio",
+    "flock_ellipse_angle_cos",
+    "flock_ellipse_angle_sin",
+    "flock_velocity_x",
+    "flock_velocity_y",
+    "flock_major_axis_change",
+    "flock_minor_axis_change",
+]
+
+TARGET_NAMES = ["rear_projection_normalized", "lateral_distance_normalized"]
 
 
 def set_seed(seed: int) -> None:
@@ -482,6 +500,49 @@ def write_filtered_dataset_csv(rows: list[dict], output_path: Path) -> None:
         writer.writerows(rows)
 
 
+def save_window_data(
+    output_path: Path,
+    raw_features: np.ndarray,
+    normalized_features: np.ndarray,
+    targets: np.ndarray,
+    mean: np.ndarray,
+    std: np.ndarray,
+) -> None:
+    """Persists exactly the arrays used by the GRU for a training or test split."""
+    np.savez_compressed(
+        output_path,
+        raw_features=raw_features,
+        normalized_features=normalized_features,
+        targets=targets,
+        feature_mean=mean,
+        feature_std=std,
+    )
+
+
+def write_predictions_csv(
+    output_path: Path,
+    predictions: list[dict],
+) -> None:
+    fieldnames = [
+        "video_id",
+        "current_frame",
+        "future_frame",
+        "predicted_x",
+        "predicted_y",
+        "real_x",
+        "real_y",
+        "pixel_error",
+        "predicted_target_0",
+        "predicted_target_1",
+        "real_target_0",
+        "real_target_1",
+    ]
+    with output_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(predictions)
+
+
 def train_one_model(
     train_features: np.ndarray,
     train_targets: np.ndarray,
@@ -493,7 +554,7 @@ def train_one_model(
     dropout: float,
     device: torch.device,
     seed: int,
-) -> tuple[FlockTargetGRUPredictor, float]:
+) -> tuple[FlockTargetGRUPredictor, float, list[dict[str, float | int]]]:
     dataset = TemporalWindowDataset(train_features, train_targets)
 
     if len(dataset) < 2:
@@ -519,8 +580,11 @@ def train_one_model(
     best_validation_loss = float("inf")
     best_state = None
 
+    history = []
+
     for epoch in range(epochs):
         model.train()
+        training_losses = []
 
         for features_batch, targets_batch in train_loader:
             features_batch = features_batch.to(device)
@@ -529,6 +593,7 @@ def train_one_model(
             loss = criterion(model(features_batch), targets_batch)
             loss.backward()
             optimizer.step()
+            training_losses.append(float(loss.item()))
 
         model.eval()
         validation_losses = []
@@ -540,6 +605,13 @@ def train_one_model(
                 validation_losses.append(float(criterion(model(features_batch), targets_batch).item()))
 
         mean_validation_loss = float(np.mean(validation_losses))
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "training_loss": float(np.mean(training_losses)),
+                "validation_loss": mean_validation_loss,
+            }
+        )
 
         if mean_validation_loss < best_validation_loss:
             best_validation_loss = mean_validation_loss
@@ -552,7 +624,7 @@ def train_one_model(
         raise RuntimeError("Training finished without a valid checkpoint.")
 
     model.load_state_dict(best_state)
-    return model, best_validation_loss
+    return model, best_validation_loss, history
 
 
 def evaluate_model(
@@ -562,9 +634,9 @@ def evaluate_model(
     mean: np.ndarray,
     std: np.ndarray,
     device: torch.device,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], list[dict]]:
     if len(metadata) == 0:
-        return {"mae_px": math.nan, "mae_norm": math.nan}
+        return {"mae_px": math.nan, "mae_norm": math.nan}, []
 
     normalized_features, _, _ = normalize_features(features, mean=mean, std=std)
 
@@ -573,6 +645,7 @@ def evaluate_model(
 
     pixel_errors = []
     normalized_errors = []
+    prediction_rows = []
 
     for prediction, sample_metadata in zip(predictions, metadata):
         predicted_x, predicted_y = denormalize_target(sample_metadata.current_row, prediction)
@@ -591,7 +664,27 @@ def evaluate_model(
             )
         )
 
-    return {"mae_px": float(np.mean(pixel_errors)), "mae_norm": float(np.mean(normalized_errors))}
+        prediction_rows.append(
+            {
+                "video_id": sample_metadata.video_id,
+                "current_frame": int(sample_metadata.current_row["frame"]),
+                "future_frame": int(sample_metadata.future_row["frame"]),
+                "predicted_x": float(predicted_x),
+                "predicted_y": float(predicted_y),
+                "real_x": real_x,
+                "real_y": real_y,
+                "pixel_error": pixel_errors[-1],
+                "predicted_target_0": float(prediction[0]),
+                "predicted_target_1": float(prediction[1]),
+                "real_target_0": float(target[0]),
+                "real_target_1": float(target[1]),
+            }
+        )
+
+    return (
+        {"mae_px": float(np.mean(pixel_errors)), "mae_norm": float(np.mean(normalized_errors))},
+        prediction_rows,
+    )
 
 
 def train_flock_target_predictor(
@@ -621,6 +714,19 @@ def train_flock_target_predictor(
 
     output_directory = OUTPUT_ROOT / run_name
     output_directory.mkdir(parents=True, exist_ok=True)
+    artifacts_directory = output_directory / "artifacts"
+    input_directory = artifacts_directory / "input"
+    processed_directory = artifacts_directory / "processed"
+    training_directory = artifacts_directory / "training"
+    predictions_directory = artifacts_directory / "outputs"
+
+    for directory in (
+        input_directory,
+        processed_directory,
+        training_directory,
+        predictions_directory,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
 
     if dataset_csv is None:
         if not video_paths:
@@ -642,6 +748,9 @@ def train_flock_target_predictor(
 
     if not dataset_csv.exists():
         raise FileNotFoundError(f"Dataset CSV not found: {dataset_csv}")
+
+    input_dataset_path = input_directory / "tracking_dataset.csv"
+    shutil.copy2(dataset_csv, input_dataset_path)
 
     rows = load_rows(dataset_csv)
 
@@ -680,6 +789,43 @@ def train_flock_target_predictor(
 
     prediction_offset_frames = max(1, int(round(prediction_horizon_seconds * float(np.median(list(fps_values.values()))))))
 
+    feature_schema_path = processed_directory / "feature_schema.json"
+    feature_schema_path.write_text(
+        json.dumps(
+            {
+                "feature_names": FEATURE_NAMES,
+                "target_names": TARGET_NAMES,
+                "raw_feature_shape": "(samples, history_length, features)",
+                "normalized_feature_shape": "(samples, history_length, features)",
+                "target_shape": "(samples, 2)",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    run_configuration_path = training_directory / "run_configuration.json"
+    run_configuration_path.write_text(
+        json.dumps(
+            {
+                "dataset_csv": str(dataset_csv),
+                "history_length": history_length,
+                "prediction_horizon_seconds": prediction_horizon_seconds,
+                "prediction_offset_frames": prediction_offset_frames,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "epochs": epochs,
+                "hidden_size": hidden_size,
+                "num_layers": num_layers,
+                "dropout": dropout,
+                "device": device_name,
+                "seed": seed,
+                "single_behind_dog": single_behind_dog,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
     metrics_path = output_directory / "leave_one_video_out_metrics.json"
     checkpoint_path = output_directory / "flock_target_predictor.pt"
     model_copy = MODELS_ROOT / f"{run_name}_flock_target_predictor.pt"
@@ -696,16 +842,37 @@ def train_flock_target_predictor(
 
     fold_results = []
 
-    for held_out_video in video_ids:
+    training_runs = []
+
+    for fold_index, held_out_video in enumerate(video_ids, start=1):
         train_videos = set(video_ids) - {held_out_video}
         train_features, train_targets, _ = build_windows(rows_by_video, history_length, prediction_offset_frames, train_videos)
-        test_features, _, test_metadata = build_windows(rows_by_video, history_length, prediction_offset_frames, {held_out_video})
+        test_features, test_targets, test_metadata = build_windows(rows_by_video, history_length, prediction_offset_frames, {held_out_video})
 
         if len(train_features) == 0 or len(test_features) == 0:
             continue
 
         normalized_train_features, mean, std = normalize_features(train_features)
-        model, best_validation_loss = train_one_model(
+        normalized_test_features, _, _ = normalize_features(test_features, mean=mean, std=std)
+        fold_name = f"fold_{fold_index:02d}"
+        save_window_data(
+            processed_directory / f"{fold_name}_training_windows.npz",
+            train_features,
+            normalized_train_features,
+            train_targets,
+            mean,
+            std,
+        )
+        save_window_data(
+            processed_directory / f"{fold_name}_test_windows.npz",
+            test_features,
+            normalized_test_features,
+            test_targets,
+            mean,
+            std,
+        )
+
+        model, best_validation_loss, history = train_one_model(
             normalized_train_features,
             train_targets,
             batch_size,
@@ -718,7 +885,33 @@ def train_flock_target_predictor(
             seed,
         )
 
-        metrics = evaluate_model(model, test_features, test_metadata, mean, std, device)
+        metrics, predictions = evaluate_model(model, test_features, test_metadata, mean, std, device)
+        predictions_path = predictions_directory / f"{fold_name}_predictions.csv"
+        write_predictions_csv(predictions_path, predictions)
+        fold_checkpoint_path = training_directory / f"{fold_name}_model.pt"
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "feature_mean": mean,
+                "feature_std": std,
+                "held_out_video": held_out_video,
+                "best_validation_loss": float(best_validation_loss),
+                "history_length": history_length,
+                "input_size": int(train_features.shape[-1]),
+                "hidden_size": hidden_size,
+                "num_layers": num_layers,
+                "dropout": dropout,
+            },
+            fold_checkpoint_path,
+        )
+        training_runs.append(
+            {
+                "fold": fold_name,
+                "held_out_video": held_out_video,
+                "history": history,
+                "checkpoint": str(fold_checkpoint_path),
+            }
+        )
         fold_results.append(
             {
                 "held_out_video": held_out_video,
@@ -727,6 +920,7 @@ def train_flock_target_predictor(
                 "best_validation_loss": float(best_validation_loss),
                 "mae_px": metrics["mae_px"],
                 "mae_norm": metrics["mae_norm"],
+                "predictions": str(predictions_path),
             }
         )
 
@@ -736,7 +930,15 @@ def train_flock_target_predictor(
         raise RuntimeError("No training windows could be built from the dataset.")
 
     normalized_all_features, final_mean, final_std = normalize_features(all_features)
-    final_model, final_validation_loss = train_one_model(
+    save_window_data(
+        processed_directory / "final_training_windows.npz",
+        all_features,
+        normalized_all_features,
+        all_targets,
+        final_mean,
+        final_std,
+    )
+    final_model, final_validation_loss, final_history = train_one_model(
         normalized_all_features,
         all_targets,
         batch_size,
@@ -769,6 +971,17 @@ def train_flock_target_predictor(
     torch.save(checkpoint, checkpoint_path)
     torch.save(checkpoint, model_copy)
 
+    training_runs.append(
+        {
+            "fold": "final",
+            "held_out_video": None,
+            "history": final_history,
+            "checkpoint": str(checkpoint_path),
+        }
+    )
+    training_history_path = training_directory / "training_history.json"
+    training_history_path.write_text(json.dumps(training_runs, indent=2), encoding="utf-8")
+
     summary = {
         "dataset_csv": str(dataset_csv),
         "videos": video_ids,
@@ -784,6 +997,15 @@ def train_flock_target_predictor(
         "leave_one_video_out": fold_results,
         "checkpoint": str(checkpoint_path),
         "model_copy": str(model_copy),
+        "artifacts": {
+            "input_dataset": str(input_dataset_path),
+            "feature_schema": str(feature_schema_path),
+            "processed_data_directory": str(processed_directory),
+            "training_directory": str(training_directory),
+            "run_configuration": str(run_configuration_path),
+            "training_history": str(training_history_path),
+            "outputs_directory": str(predictions_directory),
+        },
     }
 
     metrics_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -791,6 +1013,7 @@ def train_flock_target_predictor(
     print(f"Metrics: {metrics_path}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Model copy: {model_copy}")
+    print(f"Artifacts: {artifacts_directory}")
 
 
 def parse_arguments() -> argparse.Namespace:

@@ -22,7 +22,7 @@ from track_flock_motion import calculate_box_center
 DEFAULT_DETECTOR_MODEL_PATH = (
     PROJECT_ROOT
     / "models"
-    / "dogRobot_v2_best.pt"
+    / "dogRobot_v2_3_best.pt"
 )
 
 OUTPUT_ROOT = (
