@@ -1,4 +1,5 @@
 import argparse
+import json
 import shutil
 from pathlib import Path
 
@@ -20,6 +21,39 @@ def resolve_project_path(path: Path) -> Path:
         return path.resolve()
 
     return (PROJECT_ROOT / path).resolve()
+
+
+def evaluate_split(
+    model: YOLO,
+    dataset_yaml: Path,
+    split_name: str,
+    image_size: int,
+    batch_size: int,
+    device: str | None,
+    training_directory: Path,
+) -> tuple[Path, dict[str, float]]:
+    """Evalua un split y guarda sus curvas y matrices en una carpeta propia."""
+
+    results = model.val(
+        data=str(dataset_yaml),
+        split=split_name,
+        imgsz=image_size,
+        batch=batch_size,
+        device=device,
+        workers=0,
+        plots=True,
+        verbose=True,
+        project=str(training_directory / "evaluation"),
+        name=split_name,
+        exist_ok=True,
+    )
+
+    metrics = {
+        key: float(value)
+        for key, value in results.results_dict.items()
+    }
+
+    return Path(results.save_dir).resolve(), metrics
 
 
 def train_model(
@@ -158,26 +192,54 @@ def train_model(
         f"{destination_model.resolve()}"
     )
 
-    # Si el dataset define un split test, ejecutamos una
-    # evaluación final para no depender solo de validación.
+    # El entrenamiento ya guarda las curvas por época en results.png y
+    # results.csv. Re-evaluamos best.pt para obtener gráficas de detección
+    # finales, sin depender del último checkpoint entrenado.
+    best_model = YOLO(str(best_weights))
+    evaluation_summary: dict[str, dict[str, float | str]] = {}
+
+    print("\n" + "=" * 70)
+    print("EVALUACIÓN FINAL DE VALIDACIÓN")
+    print("=" * 70)
+
+    validation_directory, validation_metrics = evaluate_split(
+        model=best_model,
+        dataset_yaml=dataset_yaml,
+        split_name="val",
+        image_size=image_size,
+        batch_size=batch_size,
+        device=device,
+        training_directory=training_directory,
+    )
+    evaluation_summary["validation"] = {
+        "artifacts_directory": str(validation_directory),
+        **validation_metrics,
+    }
+    print(f"Resultados de validación: {validation_directory}")
+
+    # Si el dataset define un split test, ejecutamos una evaluación final
+    # totalmente separada de la selección realizada con validación.
     print("\n" + "=" * 70)
     print("EVALUACIÓN FINAL")
     print("=" * 70)
 
     try:
-        test_results = model.val(
-            data=str(dataset_yaml),
-            split="test",
-            imgsz=image_size,
-            batch=batch_size,
+        test_directory, test_metrics = evaluate_split(
+            model=best_model,
+            dataset_yaml=dataset_yaml,
+            split_name="test",
+            image_size=image_size,
+            batch_size=batch_size,
             device=device,
-            workers=0,
-            plots=True,
-            verbose=True,
+            training_directory=training_directory,
         )
+        evaluation_summary["test"] = {
+            "artifacts_directory": str(test_directory),
+            **test_metrics,
+        }
 
         print(
-            f"Evaluación test completada: {test_results.save_dir}"
+            f"Evaluación test completada: {test_directory}"
         )
 
     except Exception as error:
@@ -186,6 +248,18 @@ def train_model(
             "Continuando sin esa evaluación."
         )
         print(f"Motivo: {error}")
+
+    summary_path = training_directory / "evaluation_summary.json"
+    summary_path.write_text(
+        json.dumps(evaluation_summary, indent=2),
+        encoding="utf-8",
+    )
+
+    print("\nArtefactos para el informe:")
+    print(f"  - Curvas de entrenamiento y loss: {training_directory / 'results.png'}")
+    print(f"  - Valores por época: {training_directory / 'results.csv'}")
+    print(f"  - Matrices y curvas de validación: {validation_directory}")
+    print(f"  - Resumen de métricas: {summary_path}")
 
 
 def parse_arguments() -> argparse.Namespace:
