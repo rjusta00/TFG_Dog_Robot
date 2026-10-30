@@ -37,6 +37,17 @@ PERFORMANCE_COLUMNS = (
     "python_memory_peak_mb",
     "control_energy_proxy",
 )
+VIDEO_PERFORMANCE_COLUMNS = (
+    "frames_processed",
+    "total_seconds",
+    "mean_inference_seconds",
+    "mean_control_seconds",
+    "mean_frame_seconds",
+    "effective_fps",
+    "python_memory_peak_mb",
+    "control_energy_proxy",
+    *GPU_TELEMETRY_COLUMNS,
+)
 
 
 def resolve_project_path(path: Path) -> Path:
@@ -223,6 +234,80 @@ def draw_robot(frame: np.ndarray, state: RobotState, color: tuple[int, int, int]
     cv2.arrowedLine(frame, center, tip, (255, 255, 255), 2, tipLength=0.35)
 
 
+def save_performance_plot(
+    output_path: Path,
+    report_type: str,
+    performance_rows: list[dict],
+    video_summary: dict[str, float] | None,
+    synthetic_animals: int,
+) -> bool:
+    """Save a headless PNG report without making plotting a runtime dependency."""
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Performance plot not generated: install matplotlib to enable PNG reports.", flush=True)
+        return False
+
+    figure, axes = plt.subplots(2, 2, figsize=(14, 8), layout="constrained")
+    if report_type == "frame":
+        frames = np.asarray([row["frame"] for row in performance_rows])
+        inference_ms = 1_000.0 * np.asarray([row["inference_seconds"] for row in performance_rows])
+        control_ms = 1_000.0 * np.asarray([row["control_seconds"] for row in performance_rows])
+        frame_ms = 1_000.0 * np.asarray([row["frame_seconds"] for row in performance_rows])
+        axes[0, 0].plot(frames, inference_ms, label="YOLO inference")
+        axes[0, 0].plot(frames, control_ms, label="MPC control")
+        axes[0, 0].plot(frames, frame_ms, label="Total frame")
+        axes[0, 0].set(ylabel="Time (ms)", title="Processing time")
+        axes[0, 0].legend()
+
+        axes[0, 1].plot(frames, 1.0 / np.maximum(np.asarray([row["frame_seconds"] for row in performance_rows]), 1e-9))
+        axes[0, 1].set(ylabel="Frames/s", title="Effective processing rate")
+
+        axes[1, 0].plot(frames, [row["python_memory_peak_mb"] for row in performance_rows], label="Python peak")
+        axes[1, 0].plot(frames, [row["gpu_memory_used_mb"] for row in performance_rows], label="GPU used")
+        axes[1, 0].set(ylabel="Memory (MB)", title="Memory usage")
+        axes[1, 0].legend()
+
+        axes[1, 1].plot(frames, [row["gpu_power_w"] for row in performance_rows], label="GPU power")
+        axes[1, 1].set(ylabel="Power (W)", title="GPU power and energy per frame")
+        energy_axis = axes[1, 1].twinx()
+        energy_axis.plot(frames, [row["gpu_energy_j"] for row in performance_rows], color="tab:red", label="GPU energy")
+        energy_axis.set_ylabel("Energy (J)")
+        handles, labels = axes[1, 1].get_legend_handles_labels()
+        energy_handles, energy_labels = energy_axis.get_legend_handles_labels()
+        axes[1, 1].legend(handles + energy_handles, labels + energy_labels)
+    else:
+        assert video_summary is not None
+        axes[0, 0].bar(
+            ["Inference", "MPC control", "Frame"],
+            [
+                1_000.0 * video_summary["mean_inference_seconds"],
+                1_000.0 * video_summary["mean_control_seconds"],
+                1_000.0 * video_summary["mean_frame_seconds"],
+            ],
+        )
+        axes[0, 0].set(ylabel="Time (ms)", title="Mean processing time")
+        axes[0, 1].bar(["Effective FPS"], [video_summary["effective_fps"]])
+        axes[0, 1].set(ylabel="Frames/s", title="Processing rate")
+        axes[1, 0].bar(
+            ["Python peak", "GPU used"],
+            [video_summary["python_memory_peak_mb"], video_summary["gpu_memory_used_mb"]],
+        )
+        axes[1, 0].set(ylabel="Memory (MB)", title="Memory usage")
+        axes[1, 1].bar(["GPU energy", "Control effort"], [video_summary["gpu_energy_j"], video_summary["control_energy_proxy"]])
+        axes[1, 1].set(ylabel="J / unitless", title="Energy and control effort")
+
+    for axis in axes.flat:
+        axis.grid(axis="y", alpha=0.25)
+    figure.suptitle(f"MPC performance | synthetic animals: {synthetic_animals}")
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
+    return True
+
+
 def smooth_point(
     previous: np.ndarray | None,
     current: np.ndarray,
@@ -305,12 +390,6 @@ def simulate_video_flock_only(
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
-    started_tracing = not tracemalloc.is_tracing()
-    if started_tracing:
-        tracemalloc.start()
-    gpu_monitor = GpuTelemetryMonitor(gpu_index(args.device))
-    gpu_monitor.start()
-
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
@@ -347,6 +426,7 @@ def simulate_video_flock_only(
     print(f"MPC control period: {control_dt:.3f} s", flush=True)
     print(f"Detector: {'track + BoT-SORT' if args.use_tracker else 'predict'}", flush=True)
     print(f"Guidance mode: {args.guidance_mode}", flush=True)
+    print(f"Performance report: {args.performance_report}", flush=True)
     print(f"Output video: {output_video_path}", flush=True)
     print(f"Output CSV: {output_csv_path}", flush=True)
     print("Loading YOLO model...", flush=True)
@@ -385,6 +465,15 @@ def simulate_video_flock_only(
     )
     controller = MPCController(mpc_config, dynamics_config, SelfOrganizationRule(args.rule))
 
+    collect_performance = args.performance_report != "none"
+    started_tracing = collect_performance and not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    gpu_monitor = None
+    if collect_performance:
+        gpu_monitor = GpuTelemetryMonitor(gpu_index(args.device))
+        gpu_monitor.start()
+
     active_flock_track_id = None
     robot_state: RobotState | None = None
     previous_center: np.ndarray | None = None
@@ -400,6 +489,13 @@ def simulate_video_flock_only(
     last_optimizer_cost = float("nan")
     last_control_recovery = False
     frame_index = 0
+    performance_rows: list[dict] = []
+    total_inference_seconds = 0.0
+    total_control_seconds = 0.0
+    total_frame_seconds = 0.0
+    total_control_energy_proxy = 0.0
+    peak_memory_bytes = 0
+    last_gpu_energy_j = 0.0
 
     def solve_control(
         robot: RobotState,
@@ -655,49 +751,63 @@ def simulate_video_flock_only(
         mpc_point = None if smoothed_driving_point is None else (float(smoothed_driving_point[0]), float(smoothed_driving_point[1]))
         selected_dog = select_closest_dog(detected_dogs, mpc_point)
         metrics = build_spatial_metrics("mpc_herding", selected_dog, flock_center, mpc_point, flock_scale)
-        _, peak_memory_bytes = tracemalloc.get_traced_memory()
-        gpu_metrics = gpu_monitor.snapshot()
         # This is a unitless quadratic control-effort proxy, not electrical energy.
         control_energy_proxy = (current_control[0] ** 2 + current_control[1] ** 2) * dt
-        rows.append(
-            {
-                "frame": frame_index,
-                "status": status,
-                "flock_detected": int(selected_flock is not None),
-                "dog_detections": len(detected_dogs),
-                "robot_x": "" if robot_state is None else f"{robot_state.x:.3f}",
-                "robot_y": "" if robot_state is None else f"{robot_state.y:.3f}",
-                "robot_theta": "" if robot_state is None else f"{robot_state.theta:.6f}",
-                "robot_v": "" if robot_state is None else f"{robot_state.v:.3f}",
-                "robot_omega": "" if robot_state is None else f"{robot_state.omega:.6f}",
-                "control_v": f"{current_control[0]:.3f}",
-                "control_omega": f"{current_control[1]:.6f}",
-                "control_recovery": int(control_recovery),
-                "target_x": f"{target[0]:.3f}",
-                "target_y": f"{target[1]:.3f}",
-                "flock_center_x": "" if previous_center is None else f"{previous_center[0]:.3f}",
-                "flock_center_y": "" if previous_center is None else f"{previous_center[1]:.3f}",
-                "guidance_mode": args.guidance_mode,
-                "driving_point_x": "" if raw_driving_point is None else f"{raw_driving_point[0]:.3f}",
-                "driving_point_y": "" if raw_driving_point is None else f"{raw_driving_point[1]:.3f}",
-                "smoothed_driving_point_x": "" if smoothed_driving_point is None else f"{smoothed_driving_point[0]:.3f}",
-                "smoothed_driving_point_y": "" if smoothed_driving_point is None else f"{smoothed_driving_point[1]:.3f}",
-                "optimizer_success": int(optimizer_success),
-                "optimizer_cost": "" if math.isnan(optimizer_cost) else f"{optimizer_cost:.6f}",
-                "inference_seconds": f"{detection_seconds:.6f}",
-                "control_seconds": f"{control_seconds:.6f}",
-                "frame_seconds": f"{time.perf_counter() - frame_start_time:.6f}",
-                "python_memory_peak_mb": f"{peak_memory_bytes / (1024.0 ** 2):.3f}",
-                "control_energy_proxy": f"{control_energy_proxy:.6f}",
-                **{column: f"{gpu_metrics[column]:.6f}" for column in GPU_TELEMETRY_COLUMNS},
-                **metrics,
-            }
-        )
+        frame_seconds = time.perf_counter() - frame_start_time
+        row = {
+            "frame": frame_index,
+            "status": status,
+            "flock_detected": int(selected_flock is not None),
+            "dog_detections": len(detected_dogs),
+            "robot_x": "" if robot_state is None else f"{robot_state.x:.3f}",
+            "robot_y": "" if robot_state is None else f"{robot_state.y:.3f}",
+            "robot_theta": "" if robot_state is None else f"{robot_state.theta:.6f}",
+            "robot_v": "" if robot_state is None else f"{robot_state.v:.3f}",
+            "robot_omega": "" if robot_state is None else f"{robot_state.omega:.6f}",
+            "control_v": f"{current_control[0]:.3f}",
+            "control_omega": f"{current_control[1]:.6f}",
+            "control_recovery": int(control_recovery),
+            "target_x": f"{target[0]:.3f}",
+            "target_y": f"{target[1]:.3f}",
+            "flock_center_x": "" if previous_center is None else f"{previous_center[0]:.3f}",
+            "flock_center_y": "" if previous_center is None else f"{previous_center[1]:.3f}",
+            "guidance_mode": args.guidance_mode,
+            "driving_point_x": "" if raw_driving_point is None else f"{raw_driving_point[0]:.3f}",
+            "driving_point_y": "" if raw_driving_point is None else f"{raw_driving_point[1]:.3f}",
+            "smoothed_driving_point_x": "" if smoothed_driving_point is None else f"{smoothed_driving_point[0]:.3f}",
+            "smoothed_driving_point_y": "" if smoothed_driving_point is None else f"{smoothed_driving_point[1]:.3f}",
+            "optimizer_success": int(optimizer_success),
+            "optimizer_cost": "" if math.isnan(optimizer_cost) else f"{optimizer_cost:.6f}",
+            **metrics,
+        }
+        rows.append(row)
+
+        if collect_performance:
+            _, current_peak_memory_bytes = tracemalloc.get_traced_memory()
+            peak_memory_bytes = max(peak_memory_bytes, current_peak_memory_bytes)
+            gpu_metrics = gpu_monitor.snapshot()
+            frame_gpu_energy_j = max(0.0, gpu_metrics["gpu_energy_j"] - last_gpu_energy_j)
+            last_gpu_energy_j = gpu_metrics["gpu_energy_j"]
+            performance_rows.append(
+                {
+                    "frame": frame_index,
+                    "inference_seconds": detection_seconds,
+                    "control_seconds": control_seconds,
+                    "frame_seconds": frame_seconds,
+                    "python_memory_peak_mb": current_peak_memory_bytes / (1024.0 ** 2),
+                    "control_energy_proxy": control_energy_proxy,
+                    **gpu_metrics,
+                    "gpu_energy_j": frame_gpu_energy_j,
+                }
+            )
+            total_inference_seconds += detection_seconds
+            total_control_seconds += control_seconds
+            total_frame_seconds += frame_seconds
+            total_control_energy_proxy += control_energy_proxy
 
         frame_index += 1
         if args.max_frames is not None and frame_index >= args.max_frames:
             break
-        frame_seconds = time.perf_counter() - frame_start_time
         if args.debug_timing or frame_index % args.progress_interval == 0:
             print(
                 f"Processed {frame_index}/{total_frames} frames | "
@@ -709,10 +819,17 @@ def simulate_video_flock_only(
     capture.release()
     writer.release()
 
-    gpu_monitor.stop()
-    if rows:
-        rows[-1].update({column: f"{value:.6f}" for column, value in gpu_monitor.snapshot().items()})
+    final_gpu_metrics = {column: 0.0 for column in GPU_TELEMETRY_COLUMNS}
+    if gpu_monitor is not None:
+        gpu_monitor.stop()
+        final_gpu_metrics = gpu_monitor.snapshot()
+        if performance_rows:
+            performance_rows[-1]["gpu_energy_j"] += max(
+                0.0, final_gpu_metrics["gpu_energy_j"] - last_gpu_energy_j
+            )
     performance_csv_path = output_csv_path.with_name(f"{output_csv_path.stem}_performance.csv")
+    performance_plot_path = performance_csv_path.with_suffix(".png")
+    video_summary: dict[str, float] | None = None
     with output_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
         if rows:
             performance_columns = (*PERFORMANCE_COLUMNS, *GPU_TELEMETRY_COLUMNS)
@@ -721,12 +838,55 @@ def simulate_video_flock_only(
             writer_csv.writeheader()
             writer_csv.writerows([{column: row[column] for column in spatial_columns} for row in rows])
 
-    with performance_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
-        performance_columns = (*PERFORMANCE_COLUMNS, *GPU_TELEMETRY_COLUMNS)
-        writer_csv = csv.DictWriter(csv_file, fieldnames=["frame", *performance_columns])
-        writer_csv.writeheader()
-        writer_csv.writerows(
-            [{"frame": row["frame"], **{column: row[column] for column in performance_columns}} for row in rows]
+    if args.performance_report == "frame":
+        with performance_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+            performance_columns = (*PERFORMANCE_COLUMNS, *GPU_TELEMETRY_COLUMNS)
+            writer_csv = csv.DictWriter(csv_file, fieldnames=["frame", *performance_columns])
+            writer_csv.writeheader()
+            writer_csv.writerows(
+                [
+                    {"frame": row["frame"], **{column: f"{row[column]:.6f}" for column in performance_columns}}
+                    for row in performance_rows
+                ]
+            )
+    elif args.performance_report == "video":
+        frames_processed = len(performance_rows)
+        if frames_processed:
+            video_summary = {
+                "mean_inference_seconds": total_inference_seconds / frames_processed,
+                "mean_control_seconds": total_control_seconds / frames_processed,
+                "mean_frame_seconds": total_frame_seconds / frames_processed,
+                "effective_fps": frames_processed / total_frame_seconds if total_frame_seconds else 0.0,
+                "python_memory_peak_mb": peak_memory_bytes / (1024.0 ** 2),
+                "control_energy_proxy": total_control_energy_proxy,
+                **final_gpu_metrics,
+            }
+        with performance_csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer_csv = csv.DictWriter(csv_file, fieldnames=VIDEO_PERFORMANCE_COLUMNS)
+            writer_csv.writeheader()
+            if video_summary is not None:
+                writer_csv.writerow(
+                    {
+                        "frames_processed": frames_processed,
+                        "total_seconds": f"{total_frame_seconds:.6f}",
+                        "mean_inference_seconds": f"{video_summary['mean_inference_seconds']:.6f}",
+                        "mean_control_seconds": f"{video_summary['mean_control_seconds']:.6f}",
+                        "mean_frame_seconds": f"{video_summary['mean_frame_seconds']:.6f}",
+                        "effective_fps": f"{video_summary['effective_fps']:.6f}",
+                        "python_memory_peak_mb": f"{video_summary['python_memory_peak_mb']:.3f}",
+                        "control_energy_proxy": f"{video_summary['control_energy_proxy']:.6f}",
+                        **{column: f"{final_gpu_metrics[column]:.6f}" for column in GPU_TELEMETRY_COLUMNS},
+                    }
+                )
+
+    plot_generated = False
+    if performance_rows:
+        plot_generated = save_performance_plot(
+            output_path=performance_plot_path,
+            report_type=args.performance_report,
+            performance_rows=performance_rows,
+            video_summary=video_summary,
+            synthetic_animals=args.synthetic_animals,
         )
 
     if started_tracing:
@@ -737,7 +897,10 @@ def simulate_video_flock_only(
     print(f"Processed frames: {frame_index}", flush=True)
     print(f"Video: {output_video_path}", flush=True)
     print(f"CSV: {output_csv_path}", flush=True)
-    print(f"Performance CSV: {performance_csv_path}", flush=True)
+    if args.performance_report != "none":
+        print(f"Performance CSV: {performance_csv_path}", flush=True)
+    if plot_generated:
+        print(f"Performance plot: {performance_plot_path}", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -758,6 +921,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-tracker", action="store_true", help="Use YOLO.track + BoT-SORT. Default uses faster YOLO.predict.")
     parser.add_argument("--progress-interval", type=int, default=10)
     parser.add_argument("--debug-timing", action="store_true")
+    parser.add_argument(
+        "--performance-report",
+        choices=["video", "frame", "none"],
+        default="video",
+        help="Save performance and consumption metrics aggregated per video, per frame, or not at all.",
+    )
     parser.add_argument("--synthetic-animals", type=int, default=80)
     parser.add_argument("--rule", choices=[rule.value for rule in SelfOrganizationRule], default=SelfOrganizationRule.BOIDS.value)
     parser.add_argument("--target", type=str, default=None, help="Target point as x,y in image pixels. Example: --target 1850,350")
