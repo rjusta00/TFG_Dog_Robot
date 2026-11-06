@@ -234,6 +234,11 @@ def draw_robot(frame: np.ndarray, state: RobotState, color: tuple[int, int, int]
     cv2.arrowedLine(frame, center, tip, (255, 255, 255), 2, tipLength=0.35)
 
 
+def draw_synthetic_animals(frame: np.ndarray, positions: np.ndarray) -> None:
+    for position in np.round(positions).astype(int):
+        cv2.circle(frame, tuple(position), 3, (255, 255, 0), -1, cv2.LINE_AA)
+
+
 def save_performance_plot(
     output_path: Path,
     report_type: str,
@@ -715,6 +720,8 @@ def simulate_video_flock_only(
                 thickness=2,
             )
             draw_label(annotated, "Flock center", (center_point[0] + 10, center_point[1] - 10), (0, 255, 255))
+            if args.draw_synthetic_animals:
+                draw_synthetic_animals(annotated, positions)
 
         if smoothed_driving_point is not None:
             cv2.circle(annotated, tuple(np.round(smoothed_driving_point).astype(int)), 8, (255, 0, 255), -1)
@@ -928,6 +935,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Save performance and consumption metrics aggregated per video, per frame, or not at all.",
     )
     parser.add_argument("--synthetic-animals", type=int, default=80)
+    parser.add_argument("--draw-synthetic-animals", action="store_true", help="Draw the synthetic animal positions used by the MPC.")
     parser.add_argument("--rule", choices=[rule.value for rule in SelfOrganizationRule], default=SelfOrganizationRule.BOIDS.value)
     parser.add_argument("--target", type=str, default=None, help="Target point as x,y in image pixels. Example: --target 1850,350")
     parser.add_argument("--target-x", type=float, default=None)
