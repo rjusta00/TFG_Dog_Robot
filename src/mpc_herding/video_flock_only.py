@@ -406,7 +406,12 @@ def simulate_video_flock_only(
     if fps <= 0:
         fps = 30.0
     dt = args.dt if args.dt is not None else 1.0 / fps
-    control_interval_frames = max(1, int(round(args.control_period * fps)))
+    if args.control_interval_frames is not None:
+        if args.control_interval_frames < 1:
+            raise ValueError("--control-interval-frames must be at least 1.")
+        control_interval_frames = args.control_interval_frames
+    else:
+        control_interval_frames = max(1, int(round(args.control_period * fps)))
     control_dt = control_interval_frames / fps
 
     output_video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -428,6 +433,7 @@ def simulate_video_flock_only(
     print(f"Model: {model_path}", flush=True)
     print(f"Frames: {total_frames}", flush=True)
     print(f"FPS: {fps:.3f}", flush=True)
+    print(f"MPC control interval: {control_interval_frames} frame(s)", flush=True)
     print(f"MPC control period: {control_dt:.3f} s", flush=True)
     print(f"Detector: {'track + BoT-SORT' if args.use_tracker else 'predict'}", flush=True)
     print(f"Guidance mode: {args.guidance_mode}", flush=True)
@@ -923,6 +929,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--dt", type=float, default=None)
     parser.add_argument("--control-period", type=float, default=0.1, help="Seconds between MPC optimizations; control is held between updates.")
+    parser.add_argument(
+        "--control-interval-frames",
+        type=int,
+        default=None,
+        help="Frames between MPC optimizations. Overrides --control-period; use 5 to update one control every five frames.",
+    )
     parser.add_argument("--draw-detected-dog", action="store_true")
     parser.add_argument("--detected-dog-trajectory-frames", type=int, default=30, help="Number of future frames shown for each detected dog.")
     parser.add_argument("--use-tracker", action="store_true", help="Use YOLO.track + BoT-SORT. Default uses faster YOLO.predict.")
