@@ -138,6 +138,10 @@ def parameter_field(option: str) -> str:
     return option.removeprefix("--").replace("-", "_")
 
 
+def parameter_abbreviation(field: str) -> str:
+    return "".join(part[0] for part in field.split("_") if part).upper()
+
+
 def parse_parameter_grid(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
     if args.parameter_grid is None:
         return [
@@ -1174,8 +1178,12 @@ def main() -> int:
                 randomizer.shuffle(ordered_combinations)
                 for combination in ordered_combinations:
                     sequence += 1
-                    combination_name = "_".join(f"{field}-{value}" for field, value in combination.items()).replace("/", "_")
-                    run_name = f"{video.stem}_{phase}_{repeat:02d}_{combination_name}"
+                    combination_name = "_".join(
+                        f"{parameter_abbreviation(field)}-{value}" for field, value in combination.items()
+                    ).replace("/", "_")
+                    run_name = f"{video.stem}_{combination_name}"
+                    if repetitions > 1:
+                        run_name += f"_R-{repeat:02d}"
                     output_dir = trials_dir / phase / video.stem / combination_name
                     output_dir.mkdir(parents=True, exist_ok=True)
                     command = build_command(
